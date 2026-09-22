@@ -6,9 +6,9 @@ emitted graph stays small, since every weight in a network is such a value and c
 nothing. The primal graph is kept verbatim and the tangent nodes are appended after it, so
 the primal outputs remain available and the model can be differentiated again.
 """
-from ._build import (Context, UnsupportedOperator, assemble, conventions, rename,
-                     seeded_value_info, select)
-from .rules import FORWARD
+from . import control  # noqa: F401 -- registers the If/Scan/Loop rules
+from ._build import (Context, assemble, conventions, rename, seeded_value_info, select)
+from ._passes import forward_nodes
 
 
 def forward(model, inputs=None, outputs=None, prefix=None, dim=None, layout="casadi"):
@@ -37,21 +37,9 @@ def forward(model, inputs=None, outputs=None, prefix=None, dim=None, layout="cas
         ctx.derivative[value.name] = tangent
         ctx.add_seed(tangent)
 
-    for node in graph.node:
-        tangents = [ctx.derivative.get(name) if name else None for name in node.input]
-        if all(tangent is None for tangent in tangents):
-            continue  # nothing differentiated reaches this node; it is part of the primal
-        if node.op_type not in FORWARD:
-            raise UnsupportedOperator(
-                "no forward rule for %s (node '%s'); an operation only needs one when a "
-                "differentiated value reaches it"
-                % (node.op_type, node.name or node.output[0]))
-        produced = FORWARD[node.op_type](ctx, node, tangents)
-        if produced is None or isinstance(produced, str):
-            produced = [produced]
-        for name, tangent in zip(node.output, produced):
-            if name and tangent is not None:
-                ctx.derivative[name] = tangent
+    unpacking = ctx.b.nodes  # seed unpacking reads graph inputs only, so it can go first
+    ctx.b.nodes = []
+    body = forward_nodes(ctx, list(graph.node))
 
     derivative_outputs = []
     for value in select(graph.output, outputs, "output"):
@@ -62,4 +50,5 @@ def forward(model, inputs=None, outputs=None, prefix=None, dim=None, layout="cas
         name = rename(ctx.b, prefix + value.name)
         ctx.b.alias(seeded, name)
         derivative_outputs.append(seeded_value_info(value, name, dim, layout))
-    return assemble(result, ctx, seed_inputs, derivative_outputs)
+    return assemble(result, ctx, unpacking + body + ctx.b.nodes, seed_inputs,
+                    derivative_outputs)

@@ -13,8 +13,12 @@ was itself broadcast contributes a tangent of its own (smaller) shape, and only 
 outputs are materialized to the full shape with `Context.full`. That keeps the emitted
 graph close to the size of the primal one.
 """
+from collections import ChainMap
+
 import numpy as np
 from onnx import TensorProto, helper, numpy_helper
+
+from ._graph import all_constants, all_names, walk
 
 # Element types we differentiate; everything else rides along as a constant
 FLOAT_TYPES = (TensorProto.FLOAT, TensorProto.DOUBLE, TensorProto.FLOAT16, TensorProto.BFLOAT16)
@@ -42,22 +46,37 @@ def attribute(node, name, default=None):
 
 
 class Builder:
-    """Accumulates nodes and initializers with unique names."""
+    """Accumulates nodes and initializers with unique names.
 
-    def __init__(self, taken):
+    A child builder, for a subgraph, has its own node list but shares everything else with
+    its parent: the name allocator, because a subgraph name that collides with an outer one
+    shadows it silently; and the constants, which all go to the outermost graph so that a
+    loop body captures them rather than rebuilding them every iteration.
+    """
+
+    def __init__(self, taken=(), parent=None):
         self.nodes = []
-        self.initializers = []
-        self._taken = set(taken)
-        self._constants = {}
-        self._counter = 0
+        if parent is None:
+            self.initializers = []
+            self._taken = set(taken)
+            self._constants = {}
+            self._counter = [0]
+        else:
+            self.initializers = parent.initializers
+            self._taken = parent._taken
+            self._constants = parent._constants
+            self._counter = parent._counter
+
+    def child(self):
+        return Builder(parent=self)
 
     def name(self, stem):
         if stem not in self._taken:  # keep the natural name when it is free
             self._taken.add(stem)
             return stem
         while True:
-            self._counter += 1
-            candidate = "%s_%d" % (stem, self._counter)
+            self._counter[0] += 1
+            candidate = "%s_%d" % (stem, self._counter[0])
             if candidate not in self._taken:
                 self._taken.add(candidate)
                 return candidate
@@ -104,9 +123,13 @@ class Shapes:
         for tensor in model.graph.initializer:
             self._type[tensor.name] = tensor.data_type
             self._shape[tensor.name] = tuple(tensor.dims)
-        for graph in (inferred.graph, model.graph):
-            for value in list(graph.input) + list(graph.output) + list(graph.value_info):
-                self._absorb(value)
+        for top in (inferred.graph, model.graph):
+            for graph in walk(top):  # subgraph bodies declare their own values
+                for tensor in graph.initializer:
+                    self._type.setdefault(tensor.name, tensor.data_type)
+                    self._shape.setdefault(tensor.name, tuple(tensor.dims))
+                for value in list(graph.input) + list(graph.output) + list(graph.value_info):
+                    self._absorb(value)
 
     def _absorb(self, value):
         tensor_type = value.type.tensor_type
@@ -151,30 +174,63 @@ class Context:
 
     def __init__(self, model):
         graph = model.graph
-        taken = {value.name for value in list(graph.input) + list(graph.output)
-                 + list(graph.value_info)}
-        taken.update(t.name for t in graph.initializer)
-        taken.update(name for node in graph.node for name in node.output)
-        self.b = Builder(taken)
+        self.root = self
+        self.parent = None
+        self.b = Builder(all_names(graph))
         self.shapes = Shapes(model)
         self.opset = max([o.version for o in model.opset_import
                           if o.domain in ("", "ai.onnx")] or [18])
-        self.values = {}            # value name -> numpy array, for initializers/Constants
-        for tensor in graph.initializer:
-            self.values[tensor.name] = numpy_helper.to_array(tensor)
-        for node in graph.node:
-            if node.op_type == "Constant":
-                tensor = next((helper.get_attribute_value(a) for a in node.attribute
-                               if a.name == "value"), None)
-                if tensor is not None:
-                    self.values[node.output[0]] = numpy_helper.to_array(tensor)
+        self.values = all_constants(graph)  # initializers and Constants, any depth
         self.derivative = {}        # value name -> derivative tensor name
         self.wanted = None          # operands a reverse rule's caller will actually use
+        self.depends = set()        # reverse: values that depend on differentiated inputs
         self._seeds = []            # seed tensors, any one of which carries the seed count
         self._count = None
         self._lift = {}
         self._full = {}
         self._shape_of = {}
+        self._replacement = None    # forward: a node this step's rule substitutes
+        self._replacements = {}     # reverse: primal nodes a rule substitutes, by identity
+
+    def child(self):
+        """A scope for a subgraph.
+
+        Reads fall through to the enclosing scopes -- an outer tensor, derivative or cached
+        helper is in scope inside a subgraph -- but writes stay local, because a tensor
+        defined inside a subgraph does not exist outside it.
+        """
+        scope = object.__new__(Context)
+        scope.root = self.root
+        scope.parent = self
+        scope.b = self.b.child()
+        scope.shapes = self.shapes
+        scope.opset = self.opset
+        scope.values = self.values
+        scope.derivative = ChainMap({}, self.derivative)
+        scope.wanted = None
+        scope.depends = set()
+        scope._lift = ChainMap({}, self._lift)
+        scope._full = ChainMap({}, self._full)
+        scope._shape_of = ChainMap({}, self._shape_of)
+        scope._replacement = None
+        scope._replacements = {}
+        return scope
+
+    # --- substituting a node (control flow extends the primal node it differentiates) ---
+    def replace(self, node):
+        """Forward: emit `node` in place of the primal node being differentiated."""
+        self._replacement = node
+
+    def replace_primal(self, original, node):
+        """Reverse: have the primal pass run `node` instead of `original` (to tape it)."""
+        self._replacements[id(original)] = node
+
+    def value_info(self, name, primal, seeded=True):
+        """A subgraph input or output typed like `primal`, plus a seed axis if seeded."""
+        shape = self.shapes.shape(primal)
+        if shape is not None:
+            shape = list(shape) + ([None] if seeded else [])
+        return helper.make_tensor_value_info(name, self.shapes.dtype(primal), shape)
 
     # --- value queries ---
     def dtype(self, *names):
@@ -231,17 +287,22 @@ class Context:
 
     # --- the seed axis ---
     def add_seed(self, name):
-        self._seeds.append(name)
+        self.root._seeds.append(name)
 
     def count(self):
-        """An int64 [1] tensor holding the seed count, read off a seed tensor's last axis."""
-        if self._count is None:
-            if not self._seeds:
+        """An int64 [1] tensor holding the seed count, read off a seed tensor's last axis.
+
+        Always built in the outermost graph, from a top-level seed: every subgraph then
+        reads the same tensor by capture.
+        """
+        root = self.root
+        if root._count is None:
+            if not root._seeds:
                 raise UnsupportedOperator("no seed tensors: nothing is being differentiated")
-            shape = self.b.op("Shape", [self._seeds[0]], stem="seed_shape")
-            self._count = self.b.op(
-                "Slice", [shape, self.b.ints([-1]), self.b.ints([INT64_MAX])], stem="nseed")
-        return self._count
+            shape = root.b.op("Shape", [root._seeds[0]], stem="seed_shape")
+            root._count = root.b.op(
+                "Slice", [shape, root.b.ints([-1]), root.b.ints([INT64_MAX])], stem="nseed")
+        return root._count
 
     def shape_of(self, name):
         if name not in self._shape_of:
@@ -443,10 +504,11 @@ def rename(builder, stem):
     return name
 
 
-def assemble(result, ctx, seed_inputs, derivative_outputs):
-    """Append the emitted nodes, initializers, seed inputs and derivative outputs."""
+def assemble(result, ctx, nodes, seed_inputs, derivative_outputs):
+    """Install the node list, and append initializers, seed inputs and derivative outputs."""
     graph = result.graph
-    graph.node.extend(ctx.b.nodes)
+    graph.ClearField("node")
+    graph.node.extend(nodes)
     graph.initializer.extend(ctx.b.initializers)
     graph.input.extend(seed_inputs)
     graph.output.extend(derivative_outputs)

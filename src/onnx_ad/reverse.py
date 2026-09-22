@@ -10,9 +10,9 @@ The primal graph is kept, so a nonlinear rule reads the primal tensors it needs 
 from it rather than taking them as extra inputs. The emitted model is therefore a plain
 function of `(x, adj_y)` -- no `uses_output` convention, and it can be differentiated again.
 """
-from ._build import (Context, UnsupportedOperator, assemble, conventions, rename,
-                     seeded_value_info, select)
-from .rules import REVERSE
+from . import control  # noqa: F401 -- registers the If/Scan/Loop rules
+from ._build import (Context, assemble, conventions, rename, seeded_value_info, select)
+from ._passes import reverse_nodes
 
 
 def reverse(model, inputs=None, outputs=None, prefix=None, dim=None, layout="casadi"):
@@ -39,55 +39,29 @@ def reverse(model, inputs=None, outputs=None, prefix=None, dim=None, layout="cas
     graph = result.graph
     ctx = Context(model)
     differentiated = select(graph.input, inputs, "input")
-    depends = {value.name for value in differentiated}
-    for node in graph.node:
-        if any(name in depends for name in node.input if name):
-            depends.update(name for name in node.output if name)
 
-    pending = {}
-
-    def accumulate(name, contribution):
-        pending.setdefault(name, []).append(contribution)
-
-    def take(name):
-        """Every contribution to `name` is in hand by the time its own node is reached."""
-        return ctx.sum(pending.pop(name, []))
-
-    seed_inputs = []
+    seeds, seed_inputs = {}, []
     for value in select(graph.output, outputs, "output"):
         name = rename(ctx.b, prefix + value.name)
         seed_inputs.append(seeded_value_info(value, name, dim, layout))
         seed = ctx.unpack(name, value.name) if layout == "casadi" else name
         ctx.add_seed(seed)
-        accumulate(value.name, seed)
+        seeds[value.name] = seed
+    # unpacking may read the shape of a primal output, so it goes after the primal graph
+    unpacking = ctx.b.nodes
+    ctx.b.nodes = []
 
-    for node in reversed(graph.node):
-        if not any(name in depends for name in node.input if name):
-            continue  # constant with respect to the differentiated inputs
-        grads = [take(name) if name else None for name in node.output]
-        if all(grad is None for grad in grads):
-            continue  # this node's results do not reach a seeded output
-        if node.op_type not in REVERSE:
-            raise UnsupportedOperator(
-                "no reverse rule for %s (node '%s'); an operation only needs one when it "
-                "lies between a differentiated input and a seeded output"
-                % (node.op_type, node.name or node.output[0]))
-        ctx.wanted = {name for name in node.input if name and name in depends}
-        contributions = REVERSE[node.op_type](ctx, node, grads)
-        if isinstance(contributions, str):  # a rule must return one entry per operand
-            raise TypeError("the reverse rule for %s returned a tensor, not a list"
-                            % node.op_type)
-        for name, contribution in zip(node.input, contributions):
-            if name and contribution is not None and name in depends:
-                accumulate(name, contribution)
+    primal, adjoint, results = reverse_nodes(ctx, list(graph.node), seeds,
+                                             [value.name for value in differentiated])
 
     derivative_outputs = []
     for value in differentiated:
-        adjoint = take(value.name)
-        seeded = ctx.zeros(value.name) if adjoint is None else ctx.full(adjoint, value.name)
+        adjoint_ = results.get(value.name)
+        seeded = ctx.zeros(value.name) if adjoint_ is None else ctx.full(adjoint_, value.name)
         if layout == "casadi":
             seeded = ctx.pack(seeded, value.name)
         name = rename(ctx.b, prefix + value.name)
         ctx.b.alias(seeded, name)
         derivative_outputs.append(seeded_value_info(value, name, dim, layout))
-    return assemble(result, ctx, seed_inputs, derivative_outputs)
+    return assemble(result, ctx, primal + unpacking + adjoint + ctx.b.nodes, seed_inputs,
+                    derivative_outputs)
