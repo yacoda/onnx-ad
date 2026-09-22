@@ -48,23 +48,23 @@ def attribute(node, name, default=None):
 class Builder:
     """Accumulates nodes and initializers with unique names.
 
-    A child builder, for a subgraph, has its own node list but shares everything else with
-    its parent: the name allocator, because a subgraph name that collides with an outer one
-    shadows it silently; and the constants, which all go to the outermost graph so that a
-    loop body captures them rather than rebuilding them every iteration.
+    A child builder, for a subgraph, shares the name allocator with its parent -- a subgraph
+    name that collides with an outer one shadows it silently -- but keeps its own nodes and
+    its own constants. Constants have to be *local*: ONNX shape inference does not treat an
+    outer-scope initializer as constant data inside a subgraph, so an `Unsqueeze` whose axes
+    come from outside gets no inferred shape there, and a later pass differentiating this
+    model again could not place its seed axis.
     """
 
     def __init__(self, taken=(), parent=None):
         self.nodes = []
+        self.initializers = []
+        self._constants = {}
         if parent is None:
-            self.initializers = []
             self._taken = set(taken)
-            self._constants = {}
             self._counter = [0]
         else:
-            self.initializers = parent.initializers
             self._taken = parent._taken
-            self._constants = parent._constants
             self._counter = parent._counter
 
     def child(self):
