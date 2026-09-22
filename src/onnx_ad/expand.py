@@ -14,7 +14,7 @@ from onnx import AttributeProto, FunctionProto, TypeProto, defs, helper
 
 from ._build import FLOAT_TYPES, Builder, Shapes
 from ._graph import all_constants, all_names, node_reads, subgraphs
-from .fold import fold_constants
+from .fold import fold_constants, localize_constants
 from .rules import FORWARD
 from .unroll import _substitute, inline_constant_ifs
 
@@ -45,13 +45,13 @@ def expand_functions(model):
         state = _Expander(model, opset)
         nodes = state.nodes(list(model.graph.node))
         if not state.changed:
-            return model
+            return localize_constants(model)
         result = type(model)()
         result.CopyFrom(model)
         result.graph.ClearField("node")
         result.graph.node.extend(nodes)
         model = result
-    return fold_constants(model)
+    return localize_constants(fold_constants(model))
 
 
 class _Expander:

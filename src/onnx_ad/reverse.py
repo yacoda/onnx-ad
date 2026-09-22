@@ -39,7 +39,7 @@ def reverse(model, inputs=None, outputs=None, prefix=None, dim=None, layout="cas
     """
     prefix, dim = conventions(model, "adj", prefix, dim)
     model = expand_recurrent(model)     # RNN, GRU and LSTM as a Scan over their equations
-    model = lower(model)                # LRN, GridSample, STFT, TensorScatter
+    model = lower(model)                # LRN, GridSample, STFT, DeformConv, ...
     model = expand_functions(model)     # spec-defined functions, and constant folding
     model = inline_constant_ifs(model)  # a constant condition needs no subgraph at all
     result = type(model)()

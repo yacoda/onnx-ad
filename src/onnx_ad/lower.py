@@ -1,9 +1,9 @@
 """Lower operations the spec defines by prose alone into primitives that have rules.
 
-`LRN`, `GridSample`, `STFT` and `TensorScatter` come without a function body, yet each is a
-short composition of operations the rule table covers: a padded channel-window sum, a
-weighted sum of gathers, a gather of frames followed by a DFT, a scatter at computed
-positions. Writing that composition out -- as `expand_functions` does for the operations the
+`LRN`, `GridSample`, `STFT`, `TensorScatter` and `DeformConv` come without a function body,
+yet each is a short composition of operations the rule table covers: a padded channel-window
+sum, a weighted sum of gathers, a gather of frames followed by a DFT, a scatter at computed
+positions, sampled columns contracted with weights. Writing that composition out -- as `expand_functions` does for the operations the
 spec *does* give a body -- gives both derivative modes, to any order, without a rule of
 their own; the lowered primal is the spec's definition, evaluated with primitive kernels.
 
@@ -14,6 +14,8 @@ the padding mode, and a weight. Its derivative with respect to the grid flows th
 weights; floors and roundings contribute nothing, as they should.
 """
 import itertools
+
+import numpy as np
 
 from onnx import AttributeProto, TensorProto, helper
 
@@ -31,7 +33,7 @@ def lowering(op_type):
 
 
 def lower(model):
-    """A copy of `model` with every LRN, GridSample, STFT and TensorScatter node lowered."""
+    """A copy of `model` with every operation in `LOWERINGS` lowered."""
     if not any(node.op_type in LOWERINGS and node.domain in ("", "ai.onnx")
                for graph in walk(model.graph) for node in graph.node):
         return model
@@ -336,3 +338,73 @@ def _tap(s, index, weight, d, low, high, padding, c, dtype):
         mask = s.op("Cast", [inside], to=dtype)
         weight = mask if weight is None else s.op("Mul", [weight, mask])
     return integer, weight
+
+
+# ------------------------------------------------------------------------ DeformConv -----
+# A convolution whose taps are displaced by learned offsets: each tap reads the image
+# bilinearly, zero outside it, at (top-left of the window + tap position + offset), in pixel
+# coordinates; a mask then weights it. The lowering samples every tap of every window into a
+# column tensor -- the four bilinear corners gathered and weighted, as GridSample's linear
+# mode with zeros padding -- and contracts the columns with the weights, one MatMul per
+# group. Differentiable in the image, the offsets, the mask, the weights and the bias.
+
+@lowering("DeformConv")
+def _lower_deform_conv(s, node):
+    x, w, offset = node.input[0], node.input[1], node.input[2]
+    bias = node.input[3] if len(node.input) > 3 and node.input[3] else None
+    mask = node.input[4] if len(node.input) > 4 and node.input[4] else None
+    xs, ws, offs = s.shapes.static(x), s.shapes.static(w), s.shapes.static(offset)
+    if xs is None or ws is None or offs is None or len(xs) != 4:
+        raise UnsupportedOperator("DeformConv is lowered for 2-D inputs with declared shapes")
+    n, channels, height, width = [int(v) for v in xs]
+    out_channels, per_group = int(ws[0]), int(ws[1])
+    kernel = list(attribute(node, "kernel_shape", list(ws[2:])))
+    strides = list(attribute(node, "strides", [1, 1]))
+    dilations = list(attribute(node, "dilations", [1, 1]))
+    pads = list(attribute(node, "pads", [0, 0, 0, 0]))
+    group, offset_group = attribute(node, "group", 1), attribute(node, "offset_group", 1)
+    out_h, out_w = int(offs[2]), int(offs[3])
+    taps = kernel[0]*kernel[1]
+    points = taps*out_h*out_w
+    dtype = s.shapes.dtype(x)
+    c = lambda v: s.scalar(float(v), dtype)
+
+    # where each tap of each window sits before its offset: [taps, out_h, out_w] per axis
+    rows = (-pads[0] + strides[0]*np.arange(out_h)[None, None, :, None]
+            + dilations[0]*np.arange(kernel[0])[:, None, None, None])
+    cols = (-pads[1] + strides[1]*np.arange(out_w)[None, None, None, :]
+            + dilations[1]*np.arange(kernel[1])[None, :, None, None])
+    shape = [taps, out_h, out_w]
+    base = [s.b_.constant(np.broadcast_to(v, kernel + [out_h, out_w]).reshape(shape), dtype,
+                          shape) for v in (rows, cols)]
+    # offsets are (dy, dx) pairs per tap and offset group
+    split = s.op("Reshape", [offset, s.ints([n, offset_group, taps, 2, out_h, out_w])])
+    corners = []
+    for axis, extent in ((0, height), (1, width)):
+        shift = s.op("Gather", [split, s.int_scalar(axis)], axis=3)  # [n, og, taps, oh, ow]
+        position = s.op("Reshape", [s.op("Add", [shift, base[axis]]),
+                                    s.ints([n, offset_group, points])])
+        corners.append([_tap(s, index, weight, extent, 0.0, extent - 1.0, "zeros", c, dtype)
+                        for index, weight in _taps(s, position, "linear", c)])
+
+    per_offset_group = channels//offset_group
+    image = s.op("Reshape", [x, s.ints([n, offset_group, per_offset_group, height*width])])
+    target = s.ints([n, offset_group, per_offset_group, points])
+    terms = []
+    for (row, row_weight), (col, col_weight) in itertools.product(*corners):
+        flat = s.op("Add", [s.op("Mul", [row, s.int_scalar(width)]), col])
+        value = s.op("GatherElements", [image, s.op("Expand", [s.unsqueeze(flat, [2]), target])],
+                     axis=3)
+        weight = s.op("Mul", [row_weight, col_weight])
+        terms.append(s.op("Mul", [value, s.unsqueeze(weight, [2])]))
+    sampled = s.op("Sum", terms)                      # [n, og, C/og, taps*oh*ow]
+    if mask is not None:
+        sampled = s.op("Mul", [sampled, s.op("Reshape", [
+            mask, s.ints([n, offset_group, 1, points])])])
+    columns = s.op("Reshape", [sampled, s.ints([n, group, per_group*taps, out_h*out_w])])
+    weights = s.op("Reshape", [w, s.ints([group, out_channels//group, per_group*taps])])
+    result = s.op("Reshape", [s.op("MatMul", [weights, columns]),
+                              s.ints([n, out_channels, out_h, out_w])])
+    if bias is not None:
+        result = s.op("Add", [result, s.op("Reshape", [bias, s.ints([1, out_channels, 1, 1])])])
+    s.finish(node, result)

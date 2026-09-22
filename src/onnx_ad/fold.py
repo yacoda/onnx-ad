@@ -13,8 +13,8 @@ is known.
 import numpy as np
 from onnx import helper, numpy_helper
 
-from ._build import Shapes
-from ._graph import all_constants, node_reads
+from ._build import Builder, Shapes
+from ._graph import all_constants, all_names, captures, node_reads, subgraphs
 
 RANDOM = {"RandomNormal", "RandomUniform", "RandomNormalLike", "RandomUniformLike",
           "Bernoulli", "Multinomial"}
@@ -93,3 +93,64 @@ def _evaluate(evaluator, node, values, opset):
     except Exception:
         return None
     return [np.asarray(r) for r in results]
+
+
+def localize_constants(model, max_elements=64):
+    """A copy of `model` in which every subgraph holds its own copy of the small integer
+    constants it reads from an enclosing scope.
+
+    ONNX shape inference does not treat an outer constant as known inside a subgraph, so a
+    spec body's Scan step that unsqueezes by an outer `axes` constant leaves everything
+    downstream unshaped. The copies are initializers of the subgraph, under fresh names.
+    Only integer and boolean constants are copied -- axes, shapes, indices; what inference
+    reads -- never weights: ONNX Runtime 1.16, unoptimized, miscomputes a Scan body's MatMul
+    by a local weight initializer.
+    """
+    values = all_constants(model.graph)
+    small = {name for name, value in values.items()
+             if value.size <= max_elements and value.dtype.kind in "iub"}
+    b = Builder(all_names(model.graph))
+
+    def localize(graph):
+        """The graph's nodes, each subgraph given its local constants; None if unchanged."""
+        nodes, changed = [], False
+        for node in graph.node:
+            if not subgraphs(node):
+                nodes.append(node)
+                continue
+            copy = type(node)()
+            copy.CopyFrom(node)
+            for attribute in copy.attribute:
+                inner = [attribute.g] if attribute.HasField("g") else list(attribute.graphs)
+                for g in inner:
+                    changed |= _localize_one(g, small, values, b, localize)
+            nodes.append(copy)
+        return nodes if changed else None
+
+    nodes = localize(model.graph)
+    if nodes is None:
+        return model
+    result = type(model)()
+    result.CopyFrom(model)
+    result.graph.ClearField("node")
+    result.graph.node.extend(nodes)
+    return result
+
+
+def _localize_one(graph, small, values, b, localize):
+    """Give one subgraph (in place) local copies of the constants it captures."""
+    wanted = sorted(captures(graph) & small)
+    renamed = {}
+    for name in wanted:
+        local = b.name(name + "_local")
+        graph.initializer.append(numpy_helper.from_array(values[name], local))
+        renamed[name] = local
+    for node in graph.node:
+        for i, name in enumerate(node.input):
+            if name in renamed:
+                node.input[i] = renamed[name]
+    nodes = localize(graph)  # deeper subgraphs, which may still read outer names
+    if nodes is not None:
+        graph.ClearField("node")
+        graph.node.extend(nodes)
+    return bool(renamed) or nodes is not None

@@ -11,6 +11,7 @@ import onnx
 import onnxruntime as ort
 from onnx import TensorProto, helper, numpy_helper
 
+from onnx_ad import UnsupportedOperator, forward, reverse
 from onnx_ad.lower import LOWERINGS, lower
 from test_ad import IR_VERSION, MAX_OPSET, JacobianCase, run
 
@@ -519,6 +520,68 @@ class TensorScatterTests(LoweredCase):
 
     def test_from_the_start(self):
         self.scatter("linear", None)
+
+
+class DeformConvTests(LoweredCase):
+    """Differentiated in each operand in turn, the others constants."""
+
+    def deform(self, wrt, group=1, offset_group=1, masked=True, out=(3, 3), **attrs):
+        if MAX_OPSET < 19:
+            self.skipTest("DeformConv is opset 19")
+        kernel, out = [2, 3], list(out)
+        taps = kernel[0]*kernel[1]
+        operands = {"img": RNG.standard_normal((2, 4, 5, 6)),
+                    "w": RNG.standard_normal((6, 4//group, *kernel)),
+                    "off": 0.8*RNG.standard_normal((2, offset_group*2*taps, *out)),
+                    "b": RNG.standard_normal(6),
+                    "m": RNG.uniform(0.2, 1.0, (2, offset_group*taps, *out))}
+        if not masked:
+            del operands["m"]
+        names = ["img", "w", "off", "b"] + (["m"] if masked else [])
+        inputs = ["x" if name == wrt else name for name in names]
+        node = helper.make_node("DeformConv", inputs, ["y"], kernel_shape=kernel, group=group,
+                                offset_group=offset_group, **attrs)
+        x = operands.pop(wrt)
+        self.lowered(node, list(x.shape), [2, 6, *out],
+                     [arr(k, v) for k, v in operands.items()], opset=19, x=x,
+                     primal_tol=1e-5)
+
+    def test_each_operand(self):
+        for wrt in ("img", "w", "off", "b", "m"):
+            with self.subTest(wrt=wrt):
+                self.deform(wrt, strides=[2, 2], pads=[1, 1, 1, 1])
+
+    def test_groups(self):
+        for group, offset_group in ((2, 1), (1, 2), (2, 2)):
+            with self.subTest(group=group, offset_group=offset_group):
+                self.deform("off", group=group, offset_group=offset_group, masked=False,
+                            strides=[2, 2], pads=[1, 1, 1, 1])
+
+    def test_dilated(self):
+        self.deform("img", dilations=[2, 1], pads=[1, 0, 2, 0], strides=[1, 2], out=(6, 2))
+
+
+class RoiAlignTests(Case):
+    ROIS = arr("rois", [[0.5, 0.2, 4.1, 3.7], [1.0, 1.5, 6.9, 5.2], [-1.2, -0.7, 3.0, 2.2],
+                        [2.2, 0.0, 2.9, 5.9]])
+    BATCH = arr("batch", [0, 1, 1, 0], np.int64)
+
+    def test_attributes(self):
+        for attrs in ({}, {"sampling_ratio": 2}, {"spatial_scale": 0.5, "sampling_ratio": 1},
+                      {"coordinate_transformation_mode": "output_half_pixel"},
+                      {"output_height": 2, "output_width": 4}):
+            with self.subTest(**attrs):
+                shape = [attrs.get("output_height", 1), attrs.get("output_width", 1)]
+                self.case(helper.make_node("RoiAlign", ["x", "rois", "batch"], ["y"], **attrs),
+                          [2, 3, 6, 7], [4, 3] + shape, [self.ROIS, self.BATCH], opset=16)
+
+    def test_boxes_are_not_differentiated(self):
+        node = helper.make_node("RoiAlign", ["img", "x", "batch"], ["y"])
+        model = build(node, [4, 4], [4, 3, 1, 1],
+                      [arr("img", RNG.standard_normal((2, 3, 6, 7))), self.BATCH], opset=16)
+        for mode in (forward, reverse):
+            with self.subTest(mode=mode.__name__), self.assertRaises(UnsupportedOperator):
+                mode(model)
 
 
 if __name__ == "__main__":

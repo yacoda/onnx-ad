@@ -103,41 +103,66 @@ and must be summed back over the axes the operand was broadcast along. Where the
 shape is declared this is a static axis list; where it is symbolic the axes are computed at
 run time, so a dynamic batch dimension survives.
 
-### Operations with rules
+### Operations
 
-**Arithmetic** `Add` `Sub` `Mul` `Div` `Neg` `Pow` `Sum` `Mean` `Identity`
+All but a handful of the operations in the default ONNX domain that can carry a
+floating-point derivative are covered, in one of three ways; the handful is listed last. An
+operation needs covering only **when a differentiated value
+reaches it** — anything on a constant branch is left alone — and every derivative model is
+itself closed under differentiation: the tests check that each operation a derivative
+model uses has rules of its own, which is what makes `forward(reverse(model))` always work.
 
-**Elementwise** `Exp` `Log` `Sqrt` `Reciprocal` `Abs` `Sign` `Sin` `Cos` `Tan` `Sinh`
-`Cosh` `Asin` `Acos` `Atan` `Asinh` `Acosh` `Atanh` `Erf` `Tanh` `Sigmoid` `Relu`
-`LeakyRelu` `Elu` `Selu` `Celu` `PRelu` `ThresholdedRelu` `Softplus` `Softsign` `Shrink`
-`HardSigmoid` `HardSwish` `Mish` `Gelu` (exact and `tanh`)
+**By a rule** — 113 operations, both modes, plus 37 whose derivative is zero:
 
-**Linear algebra** `MatMul` `Gemm` `Conv` (strided, dilated, grouped, 1-D and up; weight and
-bias too) `ConvTranspose`
+* *Arithmetic and elementwise* — `Add` `Sub` `Mul` `Div` `Neg` `Pow` `Mod` `Sum` `Mean`
+  `Identity` `Exp` `Log` `Sqrt` `Reciprocal` `Abs` `Sin` `Cos` `Tan` `Sinh` `Cosh` `Asin`
+  `Acos` `Atan` `Asinh` `Acosh` `Atanh` `Erf` `Tanh` `Sigmoid` `Relu` `LeakyRelu` `Elu`
+  `Selu` `Celu` `PRelu` `ThresholdedRelu` `Softplus` `Softsign` `Shrink` `HardSigmoid`
+  `HardSwish` `Mish` `Gelu` `Cast` `CastLike`
+* *Linear algebra and convolution* — `MatMul` `Gemm` `Einsum` `Conv` `ConvTranspose`
+  `Col2Im` `DFT`
+* *Pooling and resampling* — `MaxPool` `AveragePool` `LpPool` `GlobalAveragePool`
+  `GlobalMaxPool` `GlobalLpPool` `MaxUnpool` `Resize` `Upsample` `RoiAlign` (average mode,
+  in the image)
+* *Normalization* — `BatchNormalization` (inference) `LayerNormalization`
+  `InstanceNormalization` `LpNormalization` `Softmax` `LogSoftmax` `Dropout` (inference)
+* *Reductions and scans* — `ReduceSum` `ReduceMean` `ReduceMax` `ReduceMin` `ReduceProd`
+  `ReduceLogSumExp` `ReduceL1` `ReduceL2` `ReduceSumSquare` `CumSum` `CumProd` `TopK`
+* *Shape and indexing* — `Reshape` `Flatten` `Transpose` `Squeeze` `Unsqueeze` `Expand`
+  `Concat` `Split` `Slice` `Pad` `Tile` `Trilu` `Range` `ReverseSequence` `DepthToSpace`
+  `SpaceToDepth` `Gather` `GatherElements` `GatherND` `Scatter` `ScatterElements`
+  `ScatterND` `Compress` `Unique` `Where` `Clip` `Min` `Max` `DequantizeLinear` (in the
+  scale)
+* *Control flow* — `If` `Scan` `Loop`, see below
+* *Zero derivative* — the comparisons, logical and bitwise operations, `Shape` `Size`
+  `NonZero` `ArgMax` `ArgMin` `IsNaN` `IsInf` `IsFinite` `Sign` `Floor` `Ceil` `Round` `Hardmax`
+  `OneHot` `Det` `ConstantOfShape` `EyeLike` the random operations `QuantizeLinear`
+  `NonMaxSuppression` `BitCast`
 
-**Shape** `Reshape` `Flatten` `Transpose` `Squeeze` `Unsqueeze` `Expand` `Concat` `Split`
-`Slice` `Pad` `Tile` `Gather` `GatherND` `ScatterND` `CumSum`
+**By the specification's own function body** — `Attention` `RotaryEmbedding`
+`RMSNormalization` `GroupNormalization` `MeanVarianceNormalization` `Swish`
+`ReduceLogSum` `SoftmaxCrossEntropyLoss` `NegativeLogLikelihoodLoss` `AffineGrid`
+`CenterCropPad`, and opset 27's `LinearAttention` and `CausalConvWithState`. The body is
+expanded before differentiation, at the model's opset and, where the spec generates it per
+call, for the node's actual types; shape arithmetic is folded to constants and `If`s on a
+folded condition are inlined, so the rules see static axes and shapes.
 
-**Control flow** `If` `Scan` `Loop` — see below
+**By lowering** — the spec defines these in prose only, so onnx-ad writes the composition
+out: `LRN` (a padded channel-window sum), `GridSample` (every mode, padding mode and
+alignment, following the reference implementation step by step), `DeformConv` (bilinear
+taps gathered into columns, then a grouped `MatMul`), `STFT` (gathered frames and a `DFT`)
+and `TensorScatter` (a `ScatterElements` at computed positions). `RNN`, `GRU` and `LSTM`
+become a `Scan` over their equations. A lowered operation is differentiable in every
+floating-point operand; the derivative model computes its primal with the lowered form too.
+`GridSample`'s cubic mode folds its taps back inside the image, not its coordinate, as
+PyTorch and ONNX Runtime 1.19 and later do; ONNX Runtime 1.16 differs near the border.
 
-**Reductions** `ReduceSum` `ReduceMean` `ReduceMax` `ReduceMin` `ReduceProd`
-`ReduceLogSumExp` `ReduceL1` `ReduceL2` `ReduceSumSquare`
-
-**Selection** `Where` `Clip` `Min` `Max`
-
-**Networks** `Softmax` `LogSoftmax` `LayerNormalization` `BatchNormalization` (inference)
-`Dropout` (inference) `Cast` `CastLike`
-
-**Zero derivative, and allowed to consume differentiated values** `Shape` `Size` `NonZero`
-`Equal` `Greater` `Less` `GreaterOrEqual` `LessOrEqual` `And` `Or` `Xor` `Not` the bitwise
-family `ArgMax` `ArgMin` `IsNaN` `IsInf` `Floor` `Ceil` `Round` `Hardmax` `OneHot` `Det`
-
-An operation without a rule is an error **only when a differentiated value reaches it** — a
-`Resize` on a constant branch is fine.
-
-Still missing: pooling (`MaxPool`, `AveragePool`, `GlobalAveragePool`), `Einsum`, `Resize`,
-`ScatterElements`, `LpNormalization`, `InstanceNormalization` and `GroupNormalization`. Out of
-scope: sparsity and training-mode operations.
+**Not covered** — `MaxRoiPool`; `RoiAlign` in max mode or in its boxes (PyTorch gives the
+boxes no gradient either, but silently); the `Sequence` and `Optional` types; and
+training-mode `BatchNormalization` and `Dropout`. Each is refused with a reason when a
+differentiated value reaches it. Operations whose results are integers, strings or
+booleans — `QLinearConv`, `MatMulInteger`, the string and text operations — never carry a
+derivative and need nothing.
 
 ### Control flow
 
@@ -179,6 +204,11 @@ precision, and `family` builds its second-order file:
 | Convolutional net | `Conv` `Relu` `Gemm` `Reshape` | 1e-7 | 8e-8 |
 | Indexing and reductions | `GatherND` `Slice` `Clip` `ReduceMax` `ReduceProd` `ReduceL2` `ReduceLogSumExp` | 1e-7 | 1e-7 |
 | GRU cell | `Gemm` `Split` `Sigmoid` `Tanh` | 6e-8 | 6e-8 |
+
+Exported whole, `nn.LSTM` and `nn.GRU` (bidirectional, two layers) agree with autograd to
+about 1e-7, Hessians included. A spatial transformer — `affine_grid` then `grid_sample`,
+exported at opset 20 as `AffineGrid` and `GridSample` — agrees in double precision to 1e-13,
+in the image and in `theta`, for every mode, padding mode and alignment.
 
 ## Running the result
 

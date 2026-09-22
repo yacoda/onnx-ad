@@ -139,5 +139,75 @@ class FunctionOpTests(JacobianCase):
                       opset=23)
 
 
+class Opset27Tests(JacobianCase):
+    """Operations new in opset 27, which no released ONNX Runtime loads yet. Their expansion
+    uses only operations unchanged since opset 21, so the derivative models are run stamped
+    as opset 21 -- the finite differences take the expanded primal, stamped likewise."""
+
+    def setUp(self):
+        if MAX_OPSET < 27:
+            self.skipTest("opset 27 is newer than this onnx")
+        import test_ad
+
+        def stamped(model, feeds, _run=test_ad.run):
+            copy = type(model)()
+            copy.CopyFrom(model)
+            for entry in copy.opset_import:
+                if entry.domain in ("", "ai.onnx"):
+                    entry.version = min(entry.version, 21)
+            return _run(copy, feeds)
+        self._run = test_ad.run
+        test_ad.run = stamped
+
+    def tearDown(self):
+        import test_ad
+        test_ad.run = getattr(self, "_run", test_ad.run)
+
+    def expanded(self, node, x_shape, y_shape, initializers, dtype=TensorProto.DOUBLE):
+        from onnx_ad.expand import expand_functions
+        model = build(node, x_shape, y_shape, initializers, opset=27, dtype=dtype)
+        return model, expand_functions(model)
+
+    def test_causal_conv_with_state(self):
+        # float32: ONNX Runtime's Conv has no double kernel
+        f = lambda name, shape: arr(name, RNG.standard_normal(shape), np.float32)
+        for activation in ("none", "silu"):
+            with self.subTest(activation=activation):
+                node = helper.make_node("CausalConvWithState", ["x", "w", "b", "p"],
+                                        ["y", "s"], activation=activation)
+                model, expanded = self.expanded(
+                    node, [2, 3, 5], [2, 3, 5],
+                    [f("w", (3, 1, 3)), f("b", (3,)), f("p", (2, 3, 2))], TensorProto.FLOAT)
+                x = {"x": RNG.standard_normal((2, 3, 5)).astype(np.float32)}
+                fwd = self.check(model, x, None, rtol=5e-5, differences=False)
+                import test_ad
+                np.testing.assert_allclose(fwd, test_ad.jacobian_differences(
+                    expanded, x, "x", "y", 1e-3), rtol=5e-3, atol=5e-3)
+
+    def test_linear_attention(self):
+        # the body computes in float32 whatever the input type; the output is linear in the
+        # query, so a large finite-difference step is exact up to that rounding
+        import test_ad
+        for rule in ("linear", "gated", "delta", "gated_delta"):
+            with self.subTest(update_rule=rule):
+                initializers = [arr("k", 0.5*RNG.standard_normal((2, 3, 4))),
+                                arr("v", RNG.standard_normal((2, 3, 4)))]
+                extra = ["", "", ""]
+                if "gated" in rule:
+                    initializers.append(arr("g", -0.3*np.abs(RNG.standard_normal((2, 3, 4)))))
+                    extra[1] = "g"
+                if "delta" in rule:
+                    initializers.append(arr("beta", RNG.uniform(0.1, 0.9, (2, 3, 2))))
+                    extra[2] = "beta"
+                node = helper.make_node("LinearAttention", ["x", "k", "v"] + extra,
+                                        ["y", "state"], q_num_heads=2, kv_num_heads=2,
+                                        update_rule=rule)
+                model, expanded = self.expanded(node, [2, 3, 4], [2, 3, 4], initializers)
+                x = {"x": RNG.standard_normal((2, 3, 4))}
+                fwd = self.check(model, x, None, differences=False)
+                np.testing.assert_allclose(fwd, test_ad.jacobian_differences(
+                    expanded, x, "x", "y", 0.5), rtol=1e-5, atol=1e-5)
+
+
 if __name__ == "__main__":
     unittest.main()

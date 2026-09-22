@@ -2878,3 +2878,62 @@ def _dequantize_reverse(ctx, node, grads):
     reduced = ctx.reduce_sum(product, axes, keepdims=0) if axes else product
     scale = node.input[1]
     return [None, ctx.reshape_like(reduced, scale)] + rest
+
+
+# --- RoiAlign ----------------------------------------------------------------------------------
+# Average-mode RoiAlign is linear in the image, with a matrix that depends on the boxes only:
+# forward mode is RoiAlign itself, the seeds folded into the channel axis (every channel is
+# pooled alike). For reverse mode the matrix is measured the way Resize's is -- by running
+# the node's own RoiAlign on an identity basis, one channel per pixel, all boxes on image 0
+# (the matrix does not depend on which image a box reads) -- then applied transposed and
+# scatter-added into each box's image. Max mode and differentiated boxes are refused:
+# PyTorch's roi_align gives boxes no gradient either, but silently.
+
+def _roi_align_parts(ctx, node):
+    if attribute(node, "mode", "avg") != "avg":
+        raise UnsupportedOperator("RoiAlign is differentiated in avg mode only")
+    if ctx.derivative.get(node.input[1]) or (ctx.wanted is not None and
+                                             node.input[1] in ctx.wanted):
+        raise UnsupportedOperator("RoiAlign is not differentiated in its boxes")
+    static = ctx.shapes.static(node.input[0])
+    if static is None:
+        raise UnsupportedOperator("RoiAlign needs a declared input shape to be differentiated")
+    return [int(v) for v in static], \
+        {a.name: helper.get_attribute_value(a) for a in node.attribute}
+
+
+@forward_rule("RoiAlign")
+def _roi_align_forward(ctx, node, tangents):
+    (n, channels, height, width), attrs = _roi_align_parts(ctx, node)
+    x, y = node.input[0], node.output[0]
+    folded = ctx.b.op("Reshape", [ctx.b.op("Transpose", [ctx.full(tangents[0], x)],
+                                           perm=[0, 1, 4, 2, 3]),
+                                  ctx.b.ints([n, -1, height, width])], stem="seed_channels")
+    pooled = ctx.b.op("RoiAlign", [folded] + list(node.input[1:]), stem="t_roialign", **attrs)
+    out = ctx.shapes.static(y)
+    unfolded = ctx.b.op("Reshape", [pooled, ctx.b.ints([0, channels, -1] + list(out[2:]))])
+    return ctx.b.op("Transpose", [unfolded], perm=[0, 1, 3, 4, 2], stem="t_roialign")
+
+
+@reverse_rule("RoiAlign")
+def _roi_align_reverse(ctx, node, grads):
+    if ctx.opset < 16:
+        raise UnsupportedOperator("RoiAlign needs ScatterND with reduction='add' (opset 16) "
+                                  "to be differentiated in reverse")
+    (n, channels, height, width), attrs = _roi_align_parts(ctx, node)
+    x, rois, batch, y = node.input[0], node.input[1], node.input[2], node.output[0]
+    pixels = height*width
+    basis = ctx.b.constant(np.eye(pixels).reshape(1, pixels, height, width), ctx.dtype(x),
+                           (1, pixels, height, width))
+    first = ctx.b.op("ConstantOfShape", [ctx.shape_of(batch)],
+                     value=helper.make_tensor("zero", TensorProto.INT64, [1], [0]))
+    matrix = ctx.b.op("RoiAlign", [basis, rois, first], stem="roi_matrix", **attrs)
+    matrix = ctx.b.op("Reshape", [matrix, ctx.b.ints([0, 1, pixels, -1])])  # [R, 1, HW, L]
+    adjoint = ctx.b.op("Reshape", [ctx.full(grads[0], y), ctx.b.op(
+        "Concat", [ctx.b.ints([0, channels, -1]), ctx.count()], axis=0)])  # [R, C, L, S]
+    spread = ctx.b.op("MatMul", [matrix, adjoint], stem="roi_spread")  # [R, C, HW, S]
+    zeros = ctx.b.op("Reshape", [ctx.zeros(x), ctx.b.ints([0, 0, pixels, -1])])
+    index = ctx.unsqueeze(ctx.b.op("Cast", [batch], to=TensorProto.INT64), [1])
+    scattered = ctx.b.op("ScatterND", [zeros, index, spread], reduction="add",
+                         stem="a_roialign")
+    return [ctx.reshape_like(scattered, x), None, None]

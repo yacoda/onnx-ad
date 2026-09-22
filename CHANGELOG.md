@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+Operation coverage: everything in the default domain that carries a floating-point
+derivative, bar `MaxRoiPool`, max-mode `RoiAlign` and the `Sequence`/`Optional` types.
+
+- Rules for pooling (`MaxPool`, `AveragePool`, `LpPool`, the global pools, `MaxUnpool`),
+  `Einsum`, `Resize`/`Upsample`, `DFT`, `RoiAlign`, `Col2Im`, the remaining normalizations
+  (`InstanceNormalization`, `LpNormalization`), the remaining indexing and structure
+  operations (`GatherElements`, `ScatterElements`, `Compress`, `Unique`, `TopK`, `Trilu`,
+  `Range`, `ReverseSequence`, `DepthToSpace`/`SpaceToDepth`, `CumProd`, `Mod`) and
+  `DequantizeLinear` in its scale.
+- Operations the spec defines as a function — `Attention`, `RotaryEmbedding`,
+  `RMSNormalization`, `GroupNormalization`, the losses, `AffineGrid`, ... — are expanded into
+  its body before differentiation, with their shape arithmetic folded to constants.
+- `RNN`, `GRU` and `LSTM` are expanded into a `Scan` over their equations; `LRN`,
+  `GridSample`, `DeformConv`, `STFT` and `TensorScatter` are lowered to primitives.
+- Every derivative model is checked, in the tests, to use only operations that have rules
+  themselves — the opset is closed under differentiation, so any order composes.
+- **Fixed:** `CastLike` passed a tangent reaching its type operand on to the result.
+- **Fixed:** before opset 11, `Unsqueeze` by a negative axis — which those opsets silently
+  ignore — was emitted for the seed axis; and `Slice` in its attribute form had no rule.
+
 ## 0.2.0 — 2026-09-22
 
 Control flow, and second-order families that 0.1.0 could not build.
