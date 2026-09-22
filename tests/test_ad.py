@@ -1081,61 +1081,6 @@ class CompositionTests(JacobianCase):
         np.testing.assert_allclose(got["fwd2_fwd_y"].reshape(2), np.exp(x), rtol=1e-12)
 
 
-try:
-    from onnx_complex2real import complex_step
-except ImportError:  # optional: the two packages check each other when both are present
-    complex_step = None
-
-
-@unittest.skipIf(complex_step is None, "onnx-complex2real is not installed")
-class ComplexStepTests(unittest.TestCase):
-    """The independent reference with no truncation error: f'(x)v = Im f(x + i h v)/h.
-
-    Neither package knows anything about the other's method -- one differentiates the graph
-    by a rule table, the other evaluates the untouched graph off the real axis -- so their
-    agreement to machine precision is a real check on both.
-    """
-
-    @staticmethod
-    def polynomial():
-        """A network of Add/Mul/MatMul only: the complex lowering of a transcendental
-        needs Sin/Cos, which ONNX Runtime registers in single precision only."""
-        w, b = RNG.standard_normal((4, 3)), RNG.standard_normal(3)
-        nodes = [helper.make_node("MatMul", ["x", "w"], ["h"]),
-                 helper.make_node("Add", ["h", "b"], ["p"]),
-                 helper.make_node("Mul", ["p", "p"], ["q"]),
-                 helper.make_node("Mul", ["q", "p"], ["y"])]
-        return build(nodes, [("x", [2, 4])], [("y", [2, 3])],
-                     [numpy_helper.from_array(w, "w"), numpy_helper.from_array(b, "b")])
-
-    def test_network(self):
-        model = self.polynomial()
-        x = RNG.standard_normal((2, 4))
-        direction = RNG.standard_normal((2, 4))
-        step = 1e-20
-        twin = complex_step(model)
-        reference = run(twin, {"x": x, "im_x": step*direction})["im_y"]/step
-        seeds = pack(direction[..., None], (2, 4))
-        got = unpack(run(forward(model), {"x": x, "fwd_x": seeds})["fwd_y"], (2, 3), 1)
-        np.testing.assert_allclose(got[..., 0], reference, rtol=1e-12, atol=1e-14)
-
-    def test_hessian_against_the_complex_step_of_the_adjoint(self):
-        # the complex step of an adjoint model is a forward-over-adjoint product too
-        model = self.polynomial()
-        x, direction = RNG.standard_normal((2, 4)), RNG.standard_normal((2, 4))
-        weights = RNG.standard_normal((2, 3))
-        adjoint = reverse(model)
-        step = 1e-20
-        twin = complex_step(adjoint, ["x"])
-        seeded_weights = pack(weights[..., None], (2, 3))
-        reference = run(twin, {"x": x, "im_x": step*direction,
-                               "adj_y": seeded_weights})["im_adj_x"]/step
-        hessian = forward(adjoint, inputs=["x"], outputs=["adj_x"])
-        got = run(hessian, {"x": x, "adj_y": seeded_weights,
-                            "fwd_x": pack(direction[..., None], (2, 4))})["fwd_adj_x"]
-        np.testing.assert_allclose(got, reference, rtol=1e-10, atol=1e-12)
-
-
 class SelectionTests(JacobianCase):
     def test_constant_output_gets_a_zero_derivative(self):
         nodes = [helper.make_node("Exp", ["x"], ["y"]),

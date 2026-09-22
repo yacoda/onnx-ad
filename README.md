@@ -27,7 +27,7 @@ primal outputs stay available. Any number of seed directions is evaluated in a s
 | Route | What it costs |
 | --- | --- |
 | Differentiate in PyTorch, then export | derivative graphs only for models that came from PyTorch; forward mode goes through `jvp`/`vmap`, which is where export breaks; every derivative order needs another trace |
-| Complex step ([`onnx-complex2real`](https://github.com/yacoda/onnx-complex2real)) | forward mode only, one evaluation per direction, and a convention rather than an identity at piecewise operations |
+| Complex step (`Im f(x + i h v)/h`) | forward mode only, one evaluation per direction, and a convention rather than an identity at piecewise operations |
 | **This** | needs a rule per ONNX operation — but then any ONNX model has derivatives, from any producer, at any order |
 
 The third route is the one with no ceiling. A Jacobian-vector-product graph is itself an
@@ -178,10 +178,8 @@ of the rule table: central finite differences of the primal model, an analytic J
 written in numpy, and forward against reverse — `J` and `J^T` come from separate walks over
 separate rules, so their agreement to machine precision is a real check.
 
-Where [`onnx-complex2real`](https://github.com/yacoda/onnx-complex2real) is installed, a
-further comparison runs against the complex step, `f'(x)v = Im f(x + i h v)/h`, which has no
-truncation error at all — including the complex step *of a generated adjoint model*, which
-checks both packages at once. No PyTorch is involved in the unit tests.
+No PyTorch is involved in the unit tests; comparisons against it belong in an integration
+suite, not here.
 
 ```sh
 python -m pip install -e ".[test]"

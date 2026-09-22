@@ -8,16 +8,15 @@ the `onnx` protobuf. Given a model, produce new ONNX models that compute its for
 reverse derivatives — what torch2casadi does today inside PyTorch, done from first
 principles one level down, where the graph is already flat, typed and framework-neutral.
 
-Planned repo: `yacoda/onnx-ad`. Sibling of
-[`yacoda/onnx-complex2real`](https://github.com/yacoda/onnx-complex2real), which shares its
-shape (pure `onnx` + `numpy`, no runtime dependency, MIT, per-op rule table, CLI).
+Planned repo: `yacoda/onnx-ad`. Pure `onnx` + `numpy`, no runtime dependency, MIT, per-op
+rule table, CLI.
 
 ## Why this, and why not the existing routes
 
 | Route | What it costs |
 | --- | --- |
 | PyTorch AD, then export (torch2casadi today) | derivative graphs only exist for models that came from PyTorch; forward mode goes through `jvp`/`vmap`, which is where the export breaks (seed-count specialisation in `slice_backward`, `gelu_backward`, `native_layer_norm_backward`); every derivative order needs another trace |
-| Complex step (`onnx-complex2real`) | forward mode only, one graph evaluation per direction, and a *convention* rather than an identity at piecewise operations |
+| Complex step | forward mode only, one graph evaluation per direction, and a *convention* rather than an identity at piecewise operations |
 | **Differentiate the ONNX graph itself** | needs a rule per ONNX operation — but then any ONNX model has derivatives, from any producer, at any order, with no framework in the loop |
 
 The third route is the one with no ceiling: a Jacobian-vector product graph is itself an
@@ -43,7 +42,7 @@ downstream), training-mode operations (`Dropout`, batch-norm statistics).
 
 ## Design sketch
 
-Two passes over the same rule table, in the shape `onnx-complex2real` already validates:
+Two passes over the same rule table:
 
 - A **tape**: walk `graph.node` in topological order, keeping a map from value name to the
   tangent (forward) or adjoint (reverse) tensor name, absent when the value is constant with
@@ -71,16 +70,13 @@ Two passes over the same rule table, in the shape `onnx-complex2real` already va
 
 ## Testing
 
-The bar `onnx-complex2real` sets: every rule executed through ONNX Runtime and compared
-against an independent reference, per operation and on assembled networks. References come
-from finite differences for the shape of the answer and from the complex step
-(`onnx-complex2real`) for machine-precision agreement — a pleasant property of having built
-that first: the two packages check each other, and neither depends on PyTorch to be
-believed. PyTorch comparisons belong in torch2casadi's integration tests, not here.
+Every rule executed through ONNX Runtime and compared against an independent reference, per
+operation and on assembled networks. References come from finite differences for the shape
+of the answer and from an analytic Jacobian for machine-precision agreement, so nothing
+depends on PyTorch to be believed. PyTorch comparisons belong in torch2casadi's integration
+tests, not here.
 
 ## Relationship to the other repos
-- `onnx-complex2real` stays independent: complex→real is useful on its own, and the complex
-  step remains the cheap way to get a forward direction with no rule table at all.
 - `torch2casadi` could, once this exists, export the primal only and generate the whole
   derivative family from it — no PyTorch AD in the pipeline at all. That is a later decision,
   not a promise; PyTorch's reverse AD is well tested and the ONNX-level rules must earn that
