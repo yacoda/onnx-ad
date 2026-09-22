@@ -1557,7 +1557,6 @@ def _unfold_batch_into_seed(ctx, value, reference, rank):
 def _conv_forward(ctx, node, tangents):
     attrs, spatial = _conv_attributes(ctx, node)
     x, w, y = node.input[0], node.input[1], node.output[0]
-    rank = ctx.rank(x)
     terms = []
     if tangents[0] is not None:
         folded = _fold_seed_into_batch(ctx, ctx.full(tangents[0], x), x)
@@ -1681,9 +1680,9 @@ def _scatter_nd_forward(ctx, node, tangents):
 @reverse_rule("ScatterND")
 def _scatter_nd_reverse(ctx, node, grads):
     reduction = _scatter_reduction(node)
-    data, indices, updates = node.input[0], node.input[1], node.input[2]
+    indices, updates = node.input[1], node.input[2]
     seeded = ctx.full(grads[0], node.output[0])
-    # with 'none' the scattered positions were overwritten, so none of it reaches `data`
+    # with 'none' the scattered positions were overwritten, so none of it reaches the data
     to_data = seeded if reduction == "add" else ctx.b.op(
         "ScatterND", [seeded, indices, ctx.zeros(updates)], stem="a_scatternd")
     to_updates = ctx.b.op("GatherND", [seeded, indices], stem="a_updates")
