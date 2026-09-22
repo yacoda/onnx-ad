@@ -307,5 +307,166 @@ class ScanTests(JacobianCase):
         np.testing.assert_allclose(got, want, rtol=1e-11, atol=1e-12)
 
 
+def for_loop(inputs, trips=4, width=3, use_iteration=False, scan_output=True):
+    """v' = tanh(v * w + x) for a constant trip count; also emits v' each iteration."""
+    values = {"v0": RNG.standard_normal(width), "w": RNG.standard_normal(width),
+              "x": RNG.standard_normal(width)}
+    nodes = [helper.make_node("Mul", ["v", "w"], ["m"]),
+             helper.make_node("Add", ["m", "x"], ["a"])]
+    if use_iteration:  # the body reads its iteration number: the tape has to carry it
+        nodes += [helper.make_node("Cast", ["i"], ["fi"], to=D),
+                  helper.make_node("Mul", ["fi", "x"], ["ix"]),
+                  helper.make_node("Add", ["a", "ix"], ["a2"]),
+                  helper.make_node("Tanh", ["a2"], ["v2"])]
+    else:
+        nodes += [helper.make_node("Tanh", ["a"], ["v2"])]
+    nodes += [helper.make_node("Identity", ["c"], ["c2"]),
+              helper.make_node("Identity", ["v2"], ["y"])]
+    outputs = [vi("c2", [], TensorProto.BOOL), vi("v2", [width])]
+    if scan_output:
+        outputs.append(vi("y", [width]))
+    body = helper.make_graph(nodes, "body", [vi("i", [], TensorProto.INT64),
+                                             vi("c", [], TensorProto.BOOL), vi("v", [width])],
+                             outputs)
+    loop = helper.make_node("Loop", ["trips", "", "v0"],
+                            ["vf", "ys"] if scan_output else ["vf"], body=body)
+    graph_outputs = [vi("vf", [width])] + ([vi("ys", [trips, width])] if scan_output else [])
+    m = model([loop], [vi(name, [width]) for name in inputs], graph_outputs,
+              [const(name, value) for name, value in values.items() if name not in inputs]
+              + [const("trips", np.array(trips, dtype=np.int64))])
+    return m, {name: values[name] for name in inputs}
+
+
+def while_loop(scan_output=False):
+    """v <- v * a until v reaches a limit: the trip count depends on the data."""
+    body = helper.make_graph(
+        [helper.make_node("Mul", ["v", "a"], ["v2"]),
+         helper.make_node("ReduceMax", ["v2"], ["largest"], keepdims=0),
+         helper.make_node("Less", ["largest", "limit"], ["keep"]),  # a scalar condition
+         helper.make_node("Identity", ["v"], ["y"])],
+        "body", [vi("i", [], TensorProto.INT64), vi("c", [], TensorProto.BOOL), vi("v", [2])],
+        [vi("keep", [], TensorProto.BOOL), vi("v2", [2])]
+        + ([vi("y", [2])] if scan_output else []))
+    loop = helper.make_node("Loop", ["", "go", "v0"], ["vf"] + (["ys"] if scan_output else []),
+                            body=body)
+    return model([loop], [vi("v0", [2])],
+                 [vi("vf", [2])] + ([vi("ys", ["t", 2])] if scan_output else []),
+                 [const("a", np.array([1.5, 1.25])), const("limit", np.array(10.0)),
+                  const("go", np.array(True))])
+
+
+class LoopTests(JacobianCase):
+    """Forward rides the loop; reverse tapes it, then sweeps back with a Scan."""
+
+    def check_loop(self, m, feeds, x, y, oracle=True):
+        pair = dict(inputs=[x], outputs=[y])
+        reference = None
+        if oracle:
+            flat = unroll(m)
+            self.assertNotIn("Loop", [node.op_type for node in flat.graph.node])
+            reference = jacobian_forward(flat, feeds, x, y, **pair)
+        self.check(m, feeds, reference, x=x, y=y, fd_tol=1e-5, **pair)
+
+    def test_with_respect_to_the_initial_value(self):
+        m, feeds = for_loop(["v0"])
+        for y in ("vf", "ys"):
+            with self.subTest(output=y):
+                self.check_loop(m, feeds, "v0", y)
+
+    def test_with_respect_to_captured_values(self):
+        m, feeds = for_loop(["x", "w"])
+        for x in ("x", "w"):
+            for y in ("vf", "ys"):
+                with self.subTest(input=x, output=y):
+                    self.check_loop(m, feeds, x, y)
+
+    def test_a_body_that_reads_its_iteration_number(self):
+        m, feeds = for_loop(["x"], use_iteration=True)
+        self.check_loop(m, feeds, "x", "vf")
+
+    def test_a_constant_initial_value_picks_up_a_tangent(self):
+        m, feeds = for_loop(["x"])
+        self.check_loop(m, feeds, "x", "vf")
+
+    def test_data_dependent_trip_count(self):
+        # v0 = (1, 1): the first component needs 6 multiplications by 1.5 to pass 10 and the
+        # loop stops when *either* does, so d vf/d v0 = diag(1.5^6, 1.25^6) away from a switch
+        m = while_loop()
+        v0 = np.array([1.0, 1.0])
+        self.check_loop(m, {"v0": v0}, "v0", "vf", oracle=False)
+        got = jacobian_reverse(m, {"v0": v0}, "v0", "vf")
+        np.testing.assert_allclose(got, np.diag([1.5**6, 1.25**6]), rtol=1e-12)
+
+    def test_zero_iterations(self):
+        # the loop does not run at all: the reverse sweep must be skipped, not crash on a
+        # zero-length Scan, and the adjoint passes straight through
+        m = while_loop()
+        v0 = np.array([20.0, 1.0])  # already past the limit after one multiplication...
+        body_first = jacobian_reverse(m, {"v0": v0}, "v0", "vf")
+        np.testing.assert_allclose(body_first, np.diag([1.5, 1.25]), rtol=1e-12)
+        # ...and with the condition false from the start, not even once
+        body = helper.make_graph(
+            [helper.make_node("Mul", ["v", "a"], ["v2"]),
+             helper.make_node("Identity", ["c"], ["c2"])],
+            "body", [vi("i", [], TensorProto.INT64), vi("c", [], TensorProto.BOOL),
+                     vi("v", [2])], [vi("c2", [], TensorProto.BOOL), vi("v2", [2])])
+        m = model([helper.make_node("Loop", ["", "go", "v0"], ["vf"], body=body)],
+                  [vi("v0", [2]), vi("go", [], TensorProto.BOOL)], [vi("vf", [2])],
+                  [const("a", np.array([1.5, 1.25]))])
+        for go, expected in ((False, np.eye(2)), (True, None)):
+            with self.subTest(go=go):
+                feeds = {"v0": np.array([1.0, 1.0]), "go": np.array(go)}
+                if expected is not None:
+                    self.check(m, feeds, expected, x="v0", y="vf", differences=False)
+
+    def test_trip_count_zero_at_run_time(self):
+        body = helper.make_graph(
+            [helper.make_node("Mul", ["v", "v"], ["v2"]),
+             helper.make_node("Identity", ["c"], ["c2"])],
+            "body", [vi("i", [], TensorProto.INT64), vi("c", [], TensorProto.BOOL),
+                     vi("v", [2])], [vi("c2", [], TensorProto.BOOL), vi("v2", [2])])
+        m = model([helper.make_node("Loop", ["trips", "", "v0"], ["vf"], body=body)],
+                  [vi("v0", [2]), vi("trips", [], TensorProto.INT64)], [vi("vf", [2])])
+        v0 = np.array([0.5, 1.5])
+        for trips, expected in ((0, np.eye(2)), (1, np.diag(2*v0)), (2, np.diag(4*v0**3))):
+            with self.subTest(trips=trips):
+                self.check(m, {"v0": v0, "trips": np.array(trips, dtype=np.int64)}, expected,
+                           x="v0", y="vf", differences=False)
+
+    def test_forward_over_adjoint_through_a_loop(self):
+        m, feeds = for_loop(["x"], trips=3, width=2, scan_output=False)
+        second = forward(reverse(m), inputs=["x"], outputs=["adj_x"])
+        onnx.checker.check_model(second)
+        flat = forward(reverse(unroll(m)), inputs=["x"], outputs=["adj_x"])
+        feeds_ = dict(feeds, adj_vf=np.array([[1.0], [-0.5]]),
+                      fwd_x=RNG.standard_normal((2, 1)))
+        np.testing.assert_allclose(run(second, feeds_)["fwd_adj_x"],
+                                   run(flat, feeds_)["fwd_adj_x"], rtol=1e-11, atol=1e-12)
+
+    def test_a_loop_inside_a_scan(self):
+        # the Scan body runs a two-step Loop on its state: nesting in both directions
+        inner = helper.make_graph(
+            [helper.make_node("Mul", ["u", "w"], ["uw"]), helper.make_node("Tanh", ["uw"], ["u2"]),
+             helper.make_node("Identity", ["c"], ["c2"])],
+            "inner", [vi("j", [], TensorProto.INT64), vi("c", [], TensorProto.BOOL),
+                      vi("u", [3])], [vi("c2", [], TensorProto.BOOL), vi("u2", [3])])
+        body = helper.make_graph(
+            [helper.make_node("Add", ["s", "x"], ["sx"]),
+             helper.make_node("Loop", ["two", "", "sx"], ["s2"], body=inner),
+             helper.make_node("Identity", ["s2"], ["y"])],
+            "body", [vi("s", [3]), vi("x", [3])], [vi("s2", [3]), vi("y", [3])])
+        m = model([helper.make_node("Scan", ["s0", "xs"], ["sf", "ys"], body=body,
+                                    num_scan_inputs=1)],
+                  [vi("xs", [3, 3])], [vi("sf", [3]), vi("ys", [3, 3])],
+                  [const("s0", RNG.standard_normal(3)), const("w", RNG.standard_normal(3)),
+                   const("two", np.array(2, dtype=np.int64))])
+        feeds = {"xs": RNG.standard_normal((3, 3))}
+        flat = unroll(m)
+        self.assertFalse({"Scan", "Loop"} & {node.op_type for node in flat.graph.node})
+        pair = dict(inputs=["xs"], outputs=["sf"])
+        reference = jacobian_forward(flat, feeds, "xs", "sf", **pair)
+        self.check(m, feeds, reference, x="xs", y="sf", fd_tol=1e-5, **pair)
+
+
 if __name__ == "__main__":
     unittest.main()
