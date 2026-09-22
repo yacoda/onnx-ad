@@ -2575,3 +2575,106 @@ def _resize_reverse(ctx, node, grads):
                            stem="a_resize")
         value = ctx.b.op("Transpose", [product], perm=back)
     return [value] + [None]*(len(node.input) - 1)
+
+
+# --- DFT -------------------------------------------------------------------------------------
+# Linear over the reals, the complex numbers being a trailing (re, im) axis -- which is why
+# the seed axis moves to the front for the transform: the DFT needs that last axis to be the
+# complex one. The adjoint of the unnormalized transform F is F^H = conj(F conj(.)), and of
+# the inverse (normalized by 1/N) it is DFT / N. A onesided output is a truncation, whose adjoint
+# pads with zeros; `dft_length` pads or truncates the input, whose adjoint does the opposite.
+
+def _dft_axis(ctx, node):
+    """The transformed axis, non-negative, and whether the node takes it as an input."""
+    rank = ctx.rank(node.input[0])
+    if ctx.opset >= 20:
+        values = ctx.integers(node.input[2]) if len(node.input) > 2 and node.input[2] else [-2]
+        if values is None:
+            raise UnsupportedOperator("DFT is differentiable only with a constant axis")
+        return values[0] % rank, True
+    return attribute(node, "axis", 1) % rank, False
+
+
+def _dft(ctx, value, axis, as_input, length=None, inverse=0, onesided=0):
+    """A DFT of a seed-first tensor, whose signal axis has moved one place right."""
+    operands = [value, length or ""]
+    extra = {"inverse": inverse, "onesided": onesided}
+    if as_input:
+        operands.append(ctx.b.constant(axis + 1, TensorProto.INT64, ()))
+    else:
+        extra["axis"] = axis + 1
+    while operands and not operands[-1]:
+        operands.pop()
+    return ctx.b.op("DFT", operands, stem="dft", **extra)
+
+
+@forward_rule("DFT")
+def _dft_forward(ctx, node, tangents):
+    x, y = node.input[0], node.output[0]
+    axis, as_input = _dft_axis(ctx, node)
+    length = node.input[1] if len(node.input) > 1 and node.input[1] else None
+    front = _seed_front(ctx, ctx.full(tangents[0], x), ctx.rank(x))
+    inverse, onesided = attribute(node, "inverse", 0), attribute(node, "onesided", 0)
+    if inverse and not onesided and ctx.shapes.static(y) is not None:
+        # IDFT(t) = conj(DFT(conj(t)))/N, through the forward kernel for the same reason
+        # the adjoint uses it: ONNX Runtime's double inverse DFT is only ~3e-8 accurate
+        dtype = ctx.dtype(x)
+        conjugate = ctx.b.constant([1.0, -1.0], dtype, (2,))
+        if ctx.shapes.static(x)[-1] == 1:  # a real signal: give it a zero imaginary part
+            front = _pad(ctx, front, [0]*(ctx.rank(x) + 1), [0]*ctx.rank(x) + [1])
+        moved = ctx.b.op("Mul", [_dft(ctx, ctx.b.op("Mul", [front, conjugate]), axis,
+                                      as_input, length), conjugate])
+        moved = ctx.b.op("Mul", [moved, ctx.constant(1.0/ctx.shapes.static(y)[axis], dtype)])
+    else:
+        moved = _dft(ctx, front, axis, as_input, length, inverse, onesided)
+    return _seed_back(ctx, moved, ctx.rank(y))
+
+
+@reverse_rule("DFT")
+def _dft_reverse(ctx, node, grads):
+    x, y = node.input[0], node.output[0]
+    shape_in, shape_out = ctx.shapes.static(x), ctx.shapes.static(y)
+    if shape_in is None or shape_out is None:
+        raise UnsupportedOperator("DFT needs declared shapes to be differentiated in reverse")
+    axis, as_input = _dft_axis(ctx, node)
+    inverse, onesided = attribute(node, "inverse", 0), attribute(node, "onesided", 0)
+    if onesided and inverse:
+        raise UnsupportedOperator("an inverse onesided DFT is not differentiated in reverse")
+    signal = shape_in[axis]
+    length = signal
+    if len(node.input) > 1 and node.input[1]:
+        given = ctx.integers(node.input[1])
+        if given is None:
+            raise UnsupportedOperator("DFT is differentiable in reverse only with a constant "
+                                      "dft_length")
+        length = given[0]
+    rank = len(shape_in)
+    value = _seed_front(ctx, ctx.full(grads[0], y), rank)
+    dtype = ctx.dtype(x)
+    if onesided:  # the dropped half of the spectrum got no adjoint: pad it with zeros
+        after = [0]*(rank + 1)
+        after[axis + 1] = length - shape_out[axis]
+        value = _pad(ctx, value, [0]*(rank + 1), after)
+    if shape_out[-1] == 1:  # a real signal was taken to be complex: give it a zero imaginary
+        value = _pad(ctx, value, [0]*(rank + 1), [0]*rank + [1])
+    if inverse:
+        value = ctx.b.op("Mul", [_dft(ctx, value, axis, as_input),
+                                 ctx.constant(1.0/length, dtype)])
+    else:
+        # F^H g = conj(F conj(g)): the forward transform only. N . IDFT(g) is the same
+        # thing, but ONNX Runtime's double-precision inverse DFT is accurate to ~3e-8 only,
+        # where its forward one is exact
+        conjugate = ctx.b.constant([1.0, -1.0], dtype, (2,))
+        value = ctx.b.op("Mul", [_dft(ctx, ctx.b.op("Mul", [value, conjugate]), axis,
+                                      as_input), conjugate])
+    if length > signal:  # the input was zero-padded to dft_length: the padding had no source
+        value = ctx.b.op("Slice", [value, ctx.b.ints([0]), ctx.b.ints([signal]),
+                                   ctx.b.ints([axis + 1])])
+    elif length < signal:  # the input was truncated: what was cut off got no adjoint
+        after = [0]*(rank + 1)
+        after[axis + 1] = signal - length
+        value = _pad(ctx, value, [0]*(rank + 1), after)
+    if shape_in[-1] == 1:  # the adjoint of a real signal is the real part
+        value = ctx.b.op("Slice", [value, ctx.b.ints([0]), ctx.b.ints([1]),
+                                   ctx.b.ints([rank])])
+    return [_seed_back(ctx, value, rank)] + [None]*(len(node.input) - 1)

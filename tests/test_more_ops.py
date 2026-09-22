@@ -269,5 +269,44 @@ class ResizeTests(Case):
                   [arr("scales", [1, 1, 2, 2], np.float32)], opset=9)
 
 
+class DFTTests(Case):
+    """Adjoint of the unnormalized DFT is N times the inverse; checked through every case
+    that changes what the adjoint has to undo."""
+
+    def dft(self, x_shape, y_shape, opset=17, length=None, **attrs):
+        inputs = ["x"] + (["n"] if length is not None else [])
+        initializers = [arr("n", length, np.int64)] if length is not None else []
+        self.case(helper.make_node("DFT", inputs, ["y"], axis=1, **attrs), x_shape, y_shape,
+                  initializers, opset=opset)
+
+    def test_complex(self):
+        self.dft([2, 6, 2], [2, 6, 2])
+
+    def test_inverse(self):
+        # ONNX Runtime's double inverse DFT is itself only ~3e-8 accurate, so finite
+        # differences need a large step -- harmless, a DFT being linear
+        model = build(helper.make_node("DFT", ["x"], ["y"], axis=1, inverse=1), [2, 6, 2],
+                      [2, 6, 2], opset=17)
+        self.check(model, {"x": RNG.standard_normal((2, 6, 2))}, None, step=0.5, fd_tol=1e-6)
+
+    def test_real_signal(self):
+        self.dft([2, 6, 1], [2, 6, 2])
+
+    def test_onesided(self):
+        self.dft([2, 6, 1], [2, 4, 2], onesided=1)
+
+    def test_zero_padded_length(self):
+        self.dft([2, 5, 2], [2, 8, 2], length=8)
+
+    def test_truncated_length(self):
+        self.dft([2, 7, 2], [2, 4, 2], length=4)
+
+    def test_axis_as_an_input(self):
+        if MAX_OPSET < 20:
+            self.skipTest("DFT takes its axis as an input from opset 20")
+        node = helper.make_node("DFT", ["x", "", "a"], ["y"])
+        self.case(node, [2, 6, 2], [2, 6, 2], [arr("a", 1, np.int64)], opset=20)
+
+
 if __name__ == "__main__":
     unittest.main()
