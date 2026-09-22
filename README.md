@@ -132,8 +132,9 @@ An operation without a rule is an error **only when a differentiated value reach
 
 Still missing: pooling (`MaxPool`, `AveragePool`, `GlobalAveragePool`), `ConvTranspose` as a
 primal, `Einsum`, `Resize`, the scatter operations, `LpNormalization`,
-`InstanceNormalization` and `GroupNormalization`. Out of scope for a first release: control
-flow (`Loop`, `Scan`, `If`), sparsity, and training-mode operations.
+`InstanceNormalization` and `GroupNormalization`. Control flow (`If`, `Scan`, `Loop`) has a
+design but no rules yet — see [CONTROL-FLOW.md](CONTROL-FLOW.md). Out of scope: sparsity and
+training-mode operations.
 
 ### Against PyTorch
 
