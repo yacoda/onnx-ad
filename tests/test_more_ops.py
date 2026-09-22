@@ -1,0 +1,147 @@
+"""Structure, pooling and normalization rules added after 0.2.0.
+
+Each case runs through the shared harness: forward against reverse, finite differences of
+the primal, and the closure check that every derivative model uses only operations with
+rules. Where ONNX Runtime has no double kernel the case drops to float32.
+"""
+import unittest
+
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+
+from test_ad import IR_VERSION, MAX_OPSET, JacobianCase, run
+
+RNG = np.random.default_rng(17)
+try:
+    CUMPROD = onnx.defs.get_schema("CumProd").since_version
+except Exception:
+    CUMPROD = 10**6  # not in this onnx
+
+
+def build(nodes, x_shape, y_shape, initializers=(), opset=18, dtype=TensorProto.DOUBLE,
+          outputs=None):
+    outputs = outputs or [helper.make_tensor_value_info("y", dtype, y_shape)]
+    graph = helper.make_graph(nodes if isinstance(nodes, list) else [nodes], "g",
+                              [helper.make_tensor_value_info("x", dtype, x_shape)], outputs,
+                              list(initializers))
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset)])
+    model.ir_version = IR_VERSION
+    onnx.checker.check_model(model)
+    return model
+
+
+def arr(name, value, dtype=np.float64):
+    return numpy_helper.from_array(np.asarray(value, dtype=dtype), name)
+
+
+def runs(model, feeds):
+    try:
+        run(model, feeds)
+        return True
+    except Exception:
+        return False
+
+
+class MoreOpTests(JacobianCase):
+    def case(self, nodes, x_shape, y_shape, initializers=(), opset=18, x=None, reference=None,
+             outputs=None):
+        """Double where the runtime can, float32 with a coarse step where it cannot."""
+        if opset > MAX_OPSET:
+            self.skipTest("opset %d is newer than this onnx" % opset)
+        x = RNG.standard_normal(x_shape) if x is None else x
+        model = build(nodes, x_shape, y_shape, initializers, opset, outputs=outputs)
+        if runs(model, {"x": x}):
+            return self.check(model, {"x": x}, reference, fd_tol=1e-5)
+        single = [numpy_helper.from_array(numpy_helper.to_array(t).astype(np.float32), t.name)
+                  if numpy_helper.to_array(t).dtype == np.float64 else t for t in initializers]
+        model = build(nodes, x_shape, y_shape, single, opset, dtype=TensorProto.FLOAT,
+                      outputs=[helper.make_tensor_value_info(o.name, TensorProto.FLOAT if
+                                                             o.type.tensor_type.elem_type ==
+                                                             TensorProto.DOUBLE else
+                                                             o.type.tensor_type.elem_type,
+                                                             [d.dim_value for d in
+                                                              o.type.tensor_type.shape.dim])
+                               for o in outputs] if outputs else None)
+        x = x.astype(np.float32)
+        if not runs(model, {"x": x}):
+            self.skipTest("does not run in this ONNX Runtime")
+        return self.check(model, {"x": x}, None, rtol=5e-5, step=1e-3, fd_tol=5e-3)
+
+    def test_trilu(self):
+        for upper in (0, 1):
+            with self.subTest(upper=upper):
+                self.case(helper.make_node("Trilu", ["x", "k"], ["y"], upper=upper),
+                          [2, 3, 3], [2, 3, 3], [arr("k", 1, np.int64)])
+
+    def test_reverse_sequence(self):
+        self.case(helper.make_node("ReverseSequence", ["x", "lens"], ["y"], batch_axis=1,
+                                   time_axis=0),
+                  [4, 2, 3], [4, 2, 3], [arr("lens", [4, 2], np.int64)])
+
+    def test_mod(self):
+        x = RNG.standard_normal((2, 3))*3
+        self.case(helper.make_node("Mod", ["x", "b"], ["y"], fmod=1), [2, 3], [2, 3],
+                  [arr("b", [1.3, -0.7, 2.1])], x=x)
+
+    def test_mod_divisor(self):
+        nodes = [helper.make_node("Mod", ["a", "x"], ["y"], fmod=1)]
+        self.case(nodes, [3], [3], [arr("a", [4.3, -2.9, 5.5])], x=np.array([1.3, 0.7, 2.1]))
+
+    def test_cumprod(self):
+        x = np.abs(RNG.standard_normal(4)) + 0.5
+        for reverse in (0, 1):
+            with self.subTest(reverse=reverse):
+                self.case(helper.make_node("CumProd", ["x", "a"], ["y"], reverse=reverse),
+                          [4], [4], [arr("a", 0, np.int64)], x=x, opset=CUMPROD)
+
+    def test_topk(self):
+        outputs = [helper.make_tensor_value_info("y", TensorProto.DOUBLE, [2, 2]),
+                   helper.make_tensor_value_info("i", TensorProto.INT64, [2, 2])]
+        self.case(helper.make_node("TopK", ["x", "k"], ["y", "i"], axis=1),
+                  [2, 4], [2, 2], [arr("k", [2], np.int64)], outputs=outputs)
+
+    def test_compress(self):
+        for axis in (None, 1):
+            with self.subTest(axis=axis):
+                extra = {} if axis is None else {"axis": axis}
+                shape = [3] if axis is None else [2, 2]  # the condition keeps 3 elements
+                self.case(helper.make_node("Compress", ["x", "c"], ["y"], **extra),
+                          [2, 3], shape, [arr("c", [True, False, True, True] if axis is None
+                                              else [True, False, True], np.bool_)])
+
+    def test_depth_to_space_and_back(self):
+        for op, mode, x_shape, y_shape in (("DepthToSpace", "DCR", [1, 8, 2, 3], [1, 2, 4, 6]),
+                                           ("DepthToSpace", "CRD", [1, 8, 2, 3], [1, 2, 4, 6]),
+                                           ("SpaceToDepth", None, [1, 2, 4, 6], [1, 8, 2, 3])):
+            with self.subTest(op=op, mode=mode):
+                extra = {"mode": mode} if mode else {}
+                self.case(helper.make_node(op, ["x"], ["y"], blocksize=2, **extra),
+                          x_shape, y_shape)
+
+    def test_global_pools(self):
+        for op in ("GlobalAveragePool", "GlobalMaxPool"):
+            with self.subTest(op=op):
+                self.case(helper.make_node(op, ["x"], ["y"]), [2, 3, 4, 5], [2, 3, 1, 1])
+
+    def test_global_lp_pool(self):
+        x = RNG.standard_normal((2, 3, 4)) + 0.3
+        for p in (1, 2, 3):
+            with self.subTest(p=p):
+                self.case(helper.make_node("GlobalLpPool", ["x"], ["y"], p=p), [2, 3, 4],
+                          [2, 3, 1], x=x)
+
+    def test_lp_normalization(self):
+        for p in (1, 2):
+            with self.subTest(p=p):
+                self.case(helper.make_node("LpNormalization", ["x"], ["y"], axis=1, p=p),
+                          [2, 4], [2, 4])
+
+    def test_instance_normalization(self):
+        self.case(helper.make_node("InstanceNormalization", ["x", "s", "b"], ["y"]),
+                  [2, 3, 5], [2, 3, 5], [arr("s", RNG.standard_normal(3)),
+                                         arr("b", RNG.standard_normal(3))])
+
+
+if __name__ == "__main__":
+    unittest.main()

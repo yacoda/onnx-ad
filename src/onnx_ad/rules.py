@@ -10,7 +10,8 @@ Forward rules return the tangent of the node's output, shaped like the primal ou
 trailing seed axis (possibly under-broadcast, see `_build`). Reverse rules return one
 adjoint contribution per operand, each already reduced to that operand's own shape.
 """
-from onnx import TensorProto
+import numpy as np
+from onnx import TensorProto, helper
 
 from ._build import (FLOAT_TYPES, INT64_MAX, UnsupportedOperator, attribute)
 
@@ -1856,3 +1857,333 @@ def _range_reverse(ctx, node, grads):
         to_delta = ctx.reduce_sum(ctx.b.op("Mul", [seeded, ctx.lift(_range_index(ctx, node))]),
                                   [0], keepdims=0)
     return [to_start, None, to_delta]
+
+
+# --- more structure ------------------------------------------------------------------------
+
+@forward_rule("Trilu")
+def _trilu_forward(ctx, node, tangents):
+    # Trilu masks the last two axes, which the trailing seed axis would otherwise be one of
+    x = node.input[0]
+    rank = ctx.rank(x)
+    front = _seed_front(ctx, ctx.full(tangents[0], x), rank)
+    masked = ctx.b.op("Trilu", [front] + list(node.input[1:]),
+                      upper=attribute(node, "upper", 1), stem="t_trilu")
+    return _seed_back(ctx, masked, rank)
+
+
+@reverse_rule("Trilu")
+def _trilu_reverse(ctx, node, grads):
+    # a mask is its own transpose
+    rank = ctx.rank(node.output[0])
+    front = _seed_front(ctx, ctx.full(grads[0], node.output[0]), rank)
+    masked = ctx.b.op("Trilu", [front] + list(node.input[1:]),
+                      upper=attribute(node, "upper", 1), stem="a_trilu")
+    return [_seed_back(ctx, masked, rank)] + [None]*(len(node.input) - 1)
+
+
+@forward_rule("ReverseSequence")
+def _reverse_sequence_forward(ctx, node, tangents):
+    return ctx.b.op("ReverseSequence", [ctx.full(tangents[0], node.input[0]), node.input[1]],
+                    batch_axis=attribute(node, "batch_axis", 1),
+                    time_axis=attribute(node, "time_axis", 0), stem="t_reverse")
+
+
+@reverse_rule("ReverseSequence")
+def _reverse_sequence_reverse(ctx, node, grads):
+    # reversing the first L steps of each sequence is an involution, so its own adjoint
+    return [ctx.b.op("ReverseSequence", [ctx.full(grads[0], node.output[0]), node.input[1]],
+                     batch_axis=attribute(node, "batch_axis", 1),
+                     time_axis=attribute(node, "time_axis", 0), stem="a_reverse"), None]
+
+
+def _mod_quotient(ctx, node):
+    """trunc(a/b) for fmod: y = a - b.trunc(a/b), so trunc(a/b) = (a - y)/b."""
+    if not attribute(node, "fmod", 0):
+        raise UnsupportedOperator("Mod of floating-point values needs fmod=1")
+    a, b, y = node.input[0], node.input[1], node.output[0]
+    return ctx.b.op("Div", [ctx.b.op("Sub", [a, y]), b], stem="quotient")
+
+
+@forward_rule("Mod")
+def _mod_forward(ctx, node, tangents):
+    terms = [tangents[0]] if tangents[0] is not None else []
+    if tangents[1] is not None:
+        terms.append(ctx.b.op("Neg", [ctx.b.op("Mul", [tangents[1],
+                                                        ctx.lift(_mod_quotient(ctx, node))])]))
+    return ctx.sum(terms)
+
+
+@reverse_rule("Mod")
+def _mod_reverse(ctx, node, grads):
+    g, rank = grads[0], ctx.rank(node.output[0])
+    to_b = None
+    if ctx.asked_for(node.input[1]):
+        to_b = ctx.unbroadcast(ctx.b.op("Neg", [ctx.b.op("Mul", [
+            g, ctx.lift(_mod_quotient(ctx, node))])]), rank, node.input[1])
+    return [ctx.unbroadcast(g, rank, node.input[0]), to_b]
+
+
+@forward_rule("CumProd")
+def _cumprod_forward(ctx, node, tangents):
+    # y_i = prod_{j<=i} x_j, so dy_i = y_i . sum_{j<=i} dx_j/x_j -- undefined where x is zero,
+    # as for ReduceProd
+    x, y = node.input[0], node.output[0]
+    ratio = ctx.b.op("Div", [ctx.full(tangents[0], x), ctx.lift(x)])
+    summed = ctx.b.op("CumSum", [ratio, _cumsum_axis(ctx, node)],
+                      exclusive=attribute(node, "exclusive", 0),
+                      reverse=attribute(node, "reverse", 0))
+    return ctx.b.op("Mul", [ctx.lift(y), summed], stem="t_cumprod")
+
+
+@reverse_rule("CumProd")
+def _cumprod_reverse(ctx, node, grads):
+    x, y = node.input[0], node.output[0]
+    weighted = ctx.b.op("Mul", [ctx.full(grads[0], y), ctx.lift(y)])
+    summed = ctx.b.op("CumSum", [weighted, _cumsum_axis(ctx, node)],
+                      exclusive=attribute(node, "exclusive", 0),
+                      reverse=1 - attribute(node, "reverse", 0))
+    return [ctx.b.op("Div", [summed, ctx.lift(x)], stem="a_cumprod"), None]
+
+
+@forward_rule("TopK")
+def _topk_forward(ctx, node, tangents):
+    """The values are the input gathered at the indices TopK itself reports."""
+    x, indices = node.input[0], node.output[1]
+    axis = attribute(node, "axis", -1) % ctx.rank(x)
+    values = ctx.b.op("GatherElements", [ctx.full(tangents[0], x),
+                                         _seeded_indices(ctx, indices)], axis=axis,
+                      stem="t_topk")
+    return [values, None]
+
+
+@reverse_rule("TopK")
+def _topk_reverse(ctx, node, grads):
+    if grads[0] is None:
+        return [None, None]
+    x, values, indices = node.input[0], node.output[0], node.output[1]
+    axis = attribute(node, "axis", -1) % ctx.rank(x)
+    return [ctx.b.op("ScatterElements", [ctx.zeros(x), _seeded_indices(ctx, indices),
+                                         ctx.full(grads[0], values)],
+                     axis=axis, reduction="add", stem="a_topk"), None]
+
+
+def _compress_as_gather(ctx, node):
+    """Compress is a Gather at the positions where the condition holds; returns the data
+    tensor (flattened when there is no axis), the index tensor and the axis."""
+    data, condition = node.input[0], node.input[1]
+    positions = ctx.squeeze(ctx.b.op("NonZero", [condition], stem="kept"), [0])
+    ctx.shapes.declare(positions, [None])
+    axis = attribute(node, "axis")
+    if axis is None:
+        flat = ctx.b.op("Reshape", [data, ctx.b.ints([-1])], stem="flat")
+        static = ctx.shapes.static(data)
+        ctx.shapes.declare(flat, [int(np.prod(static)) if static is not None else None],
+                           ctx.shapes.dtype(data))
+        return flat, positions, 0
+    return data, positions, axis % ctx.rank(data)
+
+
+@forward_rule("Compress")
+def _compress_forward(ctx, node, tangents):
+    data, positions, axis = _compress_as_gather(ctx, node)
+    seeded = ctx.full(tangents[0], node.input[0])
+    if data != node.input[0]:
+        seeded = ctx.reshape_like(seeded, data)
+    return ctx.b.op("Gather", [seeded, positions], axis=axis, stem="t_compress")
+
+
+@reverse_rule("Compress")
+def _compress_reverse(ctx, node, grads):
+    data, positions, axis = _compress_as_gather(ctx, node)
+    gather = helper.make_node("Gather", [data, positions], [node.output[0]], axis=axis)
+    scattered = _gather_reverse(ctx, gather, grads)[0]
+    if data != node.input[0]:
+        scattered = ctx.reshape_like(scattered, node.input[0])
+    return [scattered, None]
+
+
+def _space_depth_inverse(ctx, node, value, reference):
+    """The inverse permutation of DepthToSpace/SpaceToDepth on a batch-folded tensor."""
+    block = attribute(node, "blocksize")
+    if node.op_type == "SpaceToDepth":
+        return ctx.b.op("DepthToSpace", [value], blocksize=block, mode="DCR")
+    if attribute(node, "mode", "DCR") == "DCR":
+        return ctx.b.op("SpaceToDepth", [value], blocksize=block)
+    # CRD has no inverse op: undo its reshape-transpose-reshape explicitly
+    shape = ctx.shapes.static(reference)
+    if shape is None:
+        raise UnsupportedOperator("DepthToSpace in CRD mode needs a declared shape in reverse")
+    _, channels, height, width = shape
+    out_channels = channels//(block*block)
+    split = ctx.b.op("Reshape", [value, ctx.b.ints([-1, out_channels, height, block, width,
+                                                    block])])
+    moved = ctx.b.op("Transpose", [split], perm=[0, 1, 3, 5, 2, 4])
+    return ctx.b.op("Reshape", [moved, ctx.b.ints([-1, channels, height, width])])
+
+
+@forward_rule("DepthToSpace", "SpaceToDepth")
+def _space_depth_forward(ctx, node, tangents):
+    x, y = node.input[0], node.output[0]
+    folded = _fold_seed_into_batch(ctx, ctx.full(tangents[0], x), x)
+    moved = ctx.b.op(node.op_type, [folded], stem="t_" + node.op_type.lower(),
+                     **{a.name: helper.get_attribute_value(a) for a in node.attribute})
+    return _unfold_batch_into_seed(ctx, moved, y, ctx.rank(y))
+
+
+@reverse_rule("DepthToSpace", "SpaceToDepth")
+def _space_depth_reverse(ctx, node, grads):
+    # a permutation's adjoint is its inverse
+    x, y = node.input[0], node.output[0]
+    folded = _fold_seed_into_batch(ctx, ctx.full(grads[0], y), y)
+    return [_unfold_batch_into_seed(ctx, _space_depth_inverse(ctx, node, folded, x), x,
+                                    ctx.rank(x))]
+
+
+# --- global pooling: reductions over every spatial axis --------------------------------------
+
+def _as_reduction(node, op_type, rank, **extra):
+    """A global pool as the reduction it is, over axes 2.. with the dimensions kept."""
+    return helper.make_node(op_type, [node.input[0]], [node.output[0]],
+                            axes=list(range(2, rank)), keepdims=1, **extra)
+
+
+@forward_rule("GlobalAveragePool", "GlobalMaxPool")
+def _global_pool_forward(ctx, node, tangents):
+    op = "ReduceMean" if node.op_type == "GlobalAveragePool" else "ReduceMax"
+    reduction = _as_reduction(node, op, ctx.rank(node.input[0]))
+    return FORWARD[op](ctx, reduction, tangents)
+
+
+@reverse_rule("GlobalAveragePool", "GlobalMaxPool")
+def _global_pool_reverse(ctx, node, grads):
+    op = "ReduceMean" if node.op_type == "GlobalAveragePool" else "ReduceMax"
+    reduction = _as_reduction(node, op, ctx.rank(node.input[0]))
+    return REVERSE[op](ctx, reduction, grads)
+
+
+def _weight_lp(power):
+    """d/dx of (sum |x|^p)^(1/p): sign(x) |x|^(p-1) / y^(p-1)."""
+    def weight(ctx, node, axes, keepdims, dtype):
+        x = node.input[0]
+        reference = _reference(ctx, node, axes, keepdims)
+        lowered = ctx.constant(power - 1.0, dtype)
+        numerator = ctx.b.op("Mul", [ctx.b.op("Sign", [x]), ctx.b.op(
+            "Pow", [ctx.b.op("Abs", [x]), lowered])])
+        return ctx.b.op("Div", [numerator, ctx.b.op("Pow", [reference, lowered])])
+    return weight
+
+
+@forward_rule("GlobalLpPool")
+def _global_lp_forward(ctx, node, tangents):
+    reduction = _as_reduction(node, "ReduceSum", ctx.rank(node.input[0]))
+    axes, keepdims = _reduction_axes(ctx, reduction)
+    weight = _weight_lp(float(attribute(node, "p", 2)))(
+        ctx, reduction, axes, keepdims, ctx.dtype(node.output[0], node.input[0]))
+    return ctx.reduce_sum(ctx.b.op("Mul", [ctx.lift(weight), ctx.full(tangents[0],
+                                                                      node.input[0])]),
+                          axes, keepdims=1)
+
+
+@reverse_rule("GlobalLpPool")
+def _global_lp_reverse(ctx, node, grads):
+    reduction = _as_reduction(node, "ReduceSum", ctx.rank(node.input[0]))
+    axes, keepdims = _reduction_axes(ctx, reduction)
+    weight = _weight_lp(float(attribute(node, "p", 2)))(
+        ctx, reduction, axes, keepdims, ctx.dtype(node.output[0], node.input[0]))
+    return [ctx.full(ctx.b.op("Mul", [ctx.lift(weight), ctx.full(grads[0], node.output[0])]),
+                     node.input[0])]
+
+
+# --- more normalization ----------------------------------------------------------------------
+
+def _lp_norm_parts(ctx, node):
+    """The norm along the axis (kept), and the vector w with d norm = w . dx."""
+    x, y = node.input[0], node.output[0]
+    axis = attribute(node, "axis", -1) % ctx.rank(x)
+    power = attribute(node, "p", 2)
+    if power not in (1, 2):
+        raise UnsupportedOperator("LpNormalization is defined for p = 1 and p = 2 only")
+    op = "ReduceL2" if power == 2 else "ReduceL1"
+    norm = ctx.b.op(op, [x, ctx.b.ints([axis])], keepdims=1, stem="norm") \
+        if ctx.opset >= 18 else ctx.b.op(op, [x], axes=[axis], keepdims=1, stem="norm")
+    direction = y if power == 2 else ctx.b.op("Sign", [x])
+    return axis, norm, direction
+
+
+@forward_rule("LpNormalization")
+def _lp_normalization_forward(ctx, node, tangents):
+    # y = x / |x|, so dy = (dx - y . (w . dx)) / |x|  with w = d|x|/dx
+    axis, norm, direction = _lp_norm_parts(ctx, node)
+    seeded = ctx.full(tangents[0], node.input[0])
+    along = ctx.reduce_sum(ctx.b.op("Mul", [ctx.lift(direction), seeded]), [axis], keepdims=1)
+    return ctx.b.op("Div", [ctx.b.op("Sub", [seeded, ctx.b.op("Mul", [
+        ctx.lift(node.output[0]), along])]), ctx.lift(norm)], stem="t_lpnorm")
+
+
+@reverse_rule("LpNormalization")
+def _lp_normalization_reverse(ctx, node, grads):
+    # the transpose: (g - w . (y . g)) / |x|
+    axis, norm, direction = _lp_norm_parts(ctx, node)
+    seeded = ctx.full(grads[0], node.output[0])
+    along = ctx.reduce_sum(ctx.b.op("Mul", [ctx.lift(node.output[0]), seeded]), [axis],
+                           keepdims=1)
+    return [ctx.b.op("Div", [ctx.b.op("Sub", [seeded, ctx.b.op("Mul", [
+        ctx.lift(direction), along])]), ctx.lift(norm)], stem="a_lpnorm")]
+
+
+def _instance_norm_parts(ctx, node):
+    """Axes, standardized input and 1/sqrt(var + eps), per instance and channel."""
+    x = node.input[0]
+    rank, dtype = ctx.rank(x), ctx.dtype(node.output[0], x)
+    axes = list(range(2, rank))
+    centered = ctx.b.op("Sub", [x, ctx.reduce_mean(x, axes)])
+    variance = ctx.reduce_mean(ctx.b.op("Mul", [centered, centered]), axes)
+    invstd = ctx.b.op("Reciprocal", [ctx.b.op("Sqrt", [ctx.b.op("Add", [
+        variance, ctx.constant(attribute(node, "epsilon", 1e-5), dtype)])])], stem="invstd")
+    return axes, ctx.b.op("Mul", [centered, invstd], stem="standardized"), invstd
+
+
+def _channel(ctx, name, node):
+    """A per-channel vector reshaped to broadcast along axis 1 of the node's input."""
+    return ctx.b.op("Reshape", [name, _channel_shape(ctx, ctx.rank(node.input[0]))])
+
+
+@forward_rule("InstanceNormalization")
+def _instance_norm_forward(ctx, node, tangents):
+    axes, standardized, invstd = _instance_norm_parts(ctx, node)
+    x, scale = node.input[0], node.input[1]
+    terms = []
+    if tangents[0] is not None:
+        seeded = ctx.full(tangents[0], x)
+        centered = ctx.b.op("Sub", [seeded, ctx.reduce_mean(seeded, axes)])
+        projection = ctx.b.op("Mul", [ctx.lift(standardized), ctx.reduce_mean(
+            ctx.b.op("Mul", [ctx.lift(standardized), seeded]), axes)])
+        direction = ctx.b.op("Mul", [ctx.lift(invstd), ctx.b.op("Sub", [centered, projection])])
+        terms.append(ctx.b.op("Mul", [direction, ctx.lift(_channel(ctx, scale, node))]))
+    if tangents[1] is not None:
+        terms.append(ctx.b.op("Mul", [_as_channel(ctx, tangents[1], node),
+                                      ctx.lift(standardized)]))
+    if tangents[2] is not None:
+        terms.append(_as_channel(ctx, tangents[2], node))
+    return ctx.sum(terms)
+
+
+@reverse_rule("InstanceNormalization")
+def _instance_norm_reverse(ctx, node, grads):
+    axes, standardized, invstd = _instance_norm_parts(ctx, node)
+    x, scale, y = node.input[0], node.input[1], node.output[0]
+    rank = ctx.rank(y)
+    seeded = ctx.full(grads[0], y)
+    scaled = ctx.b.op("Mul", [seeded, ctx.lift(_channel(ctx, scale, node))])
+    centered = ctx.b.op("Sub", [scaled, ctx.reduce_mean(scaled, axes)])
+    projection = ctx.b.op("Mul", [ctx.lift(standardized), ctx.reduce_mean(
+        ctx.b.op("Mul", [ctx.lift(standardized), scaled]), axes)])
+    outside = [a for a in range(rank) if a != 1]
+
+    def per_channel(value):
+        return ctx.reshape_like(ctx.reduce_sum(value, outside, keepdims=0), node.input[1])
+
+    return [ctx.b.op("Mul", [ctx.lift(invstd), ctx.b.op("Sub", [centered, projection])]),
+            per_channel(ctx.b.op("Mul", [seeded, ctx.lift(standardized)])),
+            per_channel(seeded)]
