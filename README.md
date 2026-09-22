@@ -44,6 +44,9 @@ adjoint = reverse(model)                 # x, adj_y -> adj_x
 hessian = forward(adjoint)               # + fwd_x, fwd_adj_y -> + fwd_adj_x
 ```
 
+That only works if the rule set is closed under its own output — the reverse of `Gather` is a
+`ScatterND` and the reverse of `Conv` a `ConvTranspose`, so both have rules too.
+
 Repeated differentiation names itself the way CasADi's `diff_prefix` does: a model that
 already carries `fwd_x` gets `fwd2_`/`nfwd2` next, so `forward(forward(model))` needs no
 arguments.
@@ -110,10 +113,12 @@ run time, so a dynamic batch dimension survives.
 `HardSigmoid` `HardSwish` `Mish` `Gelu` (exact and `tanh`)
 
 **Linear algebra** `MatMul` `Gemm` `Conv` (strided, dilated, grouped, 1-D and up; weight and
-bias too)
+bias too) `ConvTranspose`
 
 **Shape** `Reshape` `Flatten` `Transpose` `Squeeze` `Unsqueeze` `Expand` `Concat` `Split`
-`Slice` `Pad` `Tile` `Gather` `GatherND` `CumSum`
+`Slice` `Pad` `Tile` `Gather` `GatherND` `ScatterND` `CumSum`
+
+**Control flow** `If` `Scan` `Loop` — see below
 
 **Reductions** `ReduceSum` `ReduceMean` `ReduceMax` `ReduceMin` `ReduceProd`
 `ReduceLogSumExp` `ReduceL1` `ReduceL2` `ReduceSumSquare`
@@ -130,17 +135,40 @@ family `ArgMax` `ArgMin` `IsNaN` `IsInf` `Floor` `Ceil` `Round` `Hardmax` `OneHo
 An operation without a rule is an error **only when a differentiated value reaches it** — a
 `Resize` on a constant branch is fine.
 
-Still missing: pooling (`MaxPool`, `AveragePool`, `GlobalAveragePool`), `ConvTranspose` as a
-primal, `Einsum`, `Resize`, the scatter operations, `LpNormalization`,
-`InstanceNormalization` and `GroupNormalization`. Control flow (`If`, `Scan`, `Loop`) has a
-design but no rules yet — see [CONTROL-FLOW.md](CONTROL-FLOW.md). Out of scope: sparsity and
-training-mode operations.
+Still missing: pooling (`MaxPool`, `AveragePool`, `GlobalAveragePool`), `Einsum`, `Resize`,
+`ScatterElements`, `LpNormalization`, `InstanceNormalization` and `GroupNormalization`. Out of
+scope: sparsity and training-mode operations.
+
+### Control flow
+
+`If`, `Scan` and `Loop` are differentiated *in place*: the primal node is replaced by one whose
+subgraph also computes the derivative, rather than a derivative being built beside it.
+
+* **`If`** — only the taken branch computes its derivative. An `If` on a constant condition is
+  inlined before either pass runs.
+* **`Scan`** — forward mode is one `Scan` carrying the tangent as extra state: two times the
+  body, any number of seeds, nothing stored. Reverse mode tapes each iteration's input state
+  and appends a second `Scan` that reads everything backwards, recomputes the body and runs
+  its adjoint. A captured weight accumulates in that scan's state, so its adjoint costs
+  `O(|w|)`, not `O(T·|w|)`.
+* **`Loop`** — the trip count may depend on the data, which is only a problem until the primal
+  has run: then it is the length of the tape. The reverse sweep is therefore `Scan`'s, reading
+  the tape backwards, behind an `If` for the loop that ran zero times.
+
+Nesting works in both directions, and so does composition: `forward(reverse(model))` through
+any of the three. The design, and what ONNX Runtime was checked to allow, is in
+[CONTROL-FLOW.md](CONTROL-FLOW.md); [the slides](docs/slides/slides.pdf) draw it.
+
+`unroll(model)` flattens every `Scan` and `Loop` whose trip count is known before the model
+runs. That is useful on its own for short, fixed-length recurrences — at the price of a graph
+that grows with the trip count — and it is what the control-flow rules are tested against: the
+Jacobian of the unrolled graph comes from entirely different code.
 
 ### Against PyTorch
 
 Every one of these exports (`torch.onnx.export`, `dynamo=True`, opset 18) differentiates in
-both modes, and the resulting Jacobian matches `torch.autograd.functional.jacobian` to
-float32 precision:
+both modes, the resulting Jacobian matches `torch.autograd.functional.jacobian` to float32
+precision, and `family` builds its second-order file:
 
 | Model | Operations | forward | reverse |
 | --- | --- | ---: | ---: |

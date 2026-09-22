@@ -1,6 +1,7 @@
 # Differentiating control flow — design brief
 
-*Status: design only. `If`, `Scan` and `Loop` have no rules yet.*
+*Status: implemented, in the order below. Where building it changed the design, the section
+says so, and [what implementation taught](#what-implementation-taught) collects it.*
 *Slides: [`docs/slides/slides.pdf`](docs/slides/slides.pdf) — the same argument as pictures.*
 
 The three operations are worth taking in the order `If`, `Scan`, `Loop`, because each adds
@@ -48,8 +49,12 @@ outer one shadows it, silently. The allocator has to be shared down the chain ev
 node lists are not. This splits today's `Builder` into a shared namer and a per-scope node
 list.
 
-**Constants stay in the outermost graph.** Subgraphs capture them, so `Builder.constant`
-keeps deduplicating globally and no constant is rebuilt per iteration.
+**Constants are local to the subgraph that uses them.** *(The design said the opposite —
+hoist every constant to the outermost graph and let subgraphs capture it. That broke
+composition: ONNX shape inference does not treat an outer-scope initializer as constant data
+inside a subgraph, so an `Unsqueeze` whose axes come from outside gets no shape there, and the
+next pass cannot place its seed axis. Runtimes load a subgraph's initializers once, so
+keeping them local costs nothing per iteration either.)*
 
 **Capture analysis.** `captures(graph)` — names read by the subgraph but produced neither
 inside it nor by its own inputs or initializers, computed recursively. Reverse mode needs it
@@ -167,10 +172,35 @@ stopgap with a size guard, never the answer for a dynamic trip count.
 
 ## Staging
 
+All four stages are done:
+
 0. `unroll` for static trip counts — small, useful on its own, and the oracle for everything after.
 1. Scope chain, shared name allocator, capture analysis; then `If`, with constant-condition inlining.
 2. `Scan` forward, then `Scan` reverse.
 3. `Loop` forward, then `Loop` reverse on top of `Scan`'s.
+
+## What implementation taught
+
+Each of these cost time, and each is now encoded in the code rather than remembered:
+
+* **Forward mode has to interleave.** A flat graph lets every tangent node go after the whole
+  primal graph. An extended `If` or `Scan` produces primal *and* tangent outputs at once, so it
+  must sit where the primal node sat — and then its tangent inputs must be computed before
+  it. Tangent nodes now follow the node they differentiate.
+* **Constants must be local** — see the infrastructure section above.
+* **ONNX shape inference gives a `Loop`'s carried outputs no shape**, and so nothing
+  downstream of them has one either. The passes now derive control-flow output shapes from
+  operands and bodies wherever inference left them blank, and infer again.
+* **Rules share the name allocator with the drivers**, so a rule that took `adj_x` for an
+  internal tensor left the convention nothing to name the output. The drivers reserve their
+  output names before the walk.
+* **A protobuf submessage is a proxy nothing else keeps alive**, so a cache keyed on `id()`
+  can hand a later object an earlier one's entry. It showed only under one protobuf backend.
+  Identity-keyed maps now keep the object and check it.
+* **The rule set has to be closed under its own output**, which the first release was not:
+  the reverse of `Gather` emits `ScatterND` and the reverse of `Conv` emits `ConvTranspose`,
+  so `family()` in 0.1.0 could not build the second-order file for a CNN. Checking
+  forward-over-adjoint through the unrolled oracle found it.
 
 ## Not in scope
 
