@@ -15,6 +15,8 @@ from ._build import UnsupportedOperator
 from .family import family, sibling
 from .forward import forward
 from .reverse import reverse
+from .unroll import UnrollTooLarge, unroll
 
-__all__ = ["forward", "reverse", "family", "sibling", "UnsupportedOperator", "__version__"]
+__all__ = ["forward", "reverse", "family", "sibling", "unroll", "UnsupportedOperator",
+           "UnrollTooLarge", "__version__"]
 __version__ = "0.1.0"

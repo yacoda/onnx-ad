@@ -14,6 +14,7 @@ outputs are materialized to the full shape with `Context.full`. That keeps the e
 graph close to the size of the primal one.
 """
 from collections import ChainMap
+from typing import Any
 
 import numpy as np
 from onnx import TensorProto, helper, numpy_helper
@@ -24,7 +25,7 @@ from ._graph import all_constants, all_names, walk
 FLOAT_TYPES = (TensorProto.FLOAT, TensorProto.DOUBLE, TensorProto.FLOAT16, TensorProto.BFLOAT16)
 NUMPY_OF = {TensorProto.FLOAT: np.float32, TensorProto.DOUBLE: np.float64,
             TensorProto.FLOAT16: np.float16, TensorProto.INT64: np.int64,
-            TensorProto.INT32: np.int32}
+            TensorProto.INT32: np.int32, TensorProto.BOOL: np.bool_}
 INT64_MAX = np.iinfo(np.int64).max
 
 
@@ -32,7 +33,7 @@ class UnsupportedOperator(Exception):
     """A differentiated value reached an operation with no rule."""
 
 
-def attribute(node, name, default=None):
+def attribute(node, name, default=None) -> Any:
     """An attribute's value, with string attributes decoded -- onnx hands those back as
     bytes, and a rule comparing one against "tanh" or "SAME_UPPER" would silently never
     match, taking a wrong branch rather than failing."""

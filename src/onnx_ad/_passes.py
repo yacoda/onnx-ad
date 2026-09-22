@@ -16,6 +16,15 @@ from ._graph import node_reads, reachable
 from .rules import FORWARD, REVERSE
 
 
+class Pairs(list):
+    """Adjoint contributions as (name, value) pairs.
+
+    For a rule whose operands include captured values, contributions cannot be matched to
+    `node.input` by position. Nor can they be a dict: the same outer tensor may feed a node
+    twice -- as a loop's initial state and as a scan input -- and both contributions count.
+    """
+
+
 def forward_nodes(ctx, nodes):
     """The node list with tangent nodes interleaved; `ctx.derivative` gains the tangents."""
     emitted = []
@@ -91,7 +100,7 @@ def reverse_nodes(ctx, nodes, seeds, differentiated):
         if isinstance(contributions, str):  # a rule must return one entry per operand
             raise TypeError("the reverse rule for %s returned a tensor, not a list"
                             % node.op_type)
-        items = contributions.items() if isinstance(contributions, dict) else \
+        items = contributions if isinstance(contributions, Pairs) else \
             zip(node.input, contributions)
         for name, contribution in items:
             if name and contribution is not None and name in depends:

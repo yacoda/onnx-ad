@@ -732,6 +732,26 @@ class IndexingTests(JacobianCase):
                 expected[row*2 + k, row*3 + index] = 1
         self.check(model, {"x": RNG.standard_normal((2, 3))}, expected)
 
+    def test_gather_with_a_scalar_index(self):
+        # `x[2]` exports to exactly this: the gathered axis disappears
+        for index in (2, -1):
+            with self.subTest(index=index):
+                m = build([helper.make_node("Gather", ["x", "i"], ["y"], axis=0)],
+                          [("x", [4, 3])], [("y", [3])],
+                          [numpy_helper.from_array(np.array(index, dtype=np.int64), "i")])
+                expected = np.zeros((3, 12))
+                row = index % 4
+                expected[:, row*3:(row + 1)*3] = np.eye(3)
+                self.check(m, {"x": RNG.standard_normal((4, 3))}, expected)
+
+    def test_gather_with_int32_indices(self):
+        m = build([helper.make_node("Gather", ["x", "i"], ["y"], axis=0)],
+                  [("x", [4])], [("y", [2])],
+                  [numpy_helper.from_array(np.array([3, 1], dtype=np.int32), "i")])
+        expected = np.zeros((2, 4))
+        expected[0, 3] = expected[1, 1] = 1
+        self.check(m, {"x": RNG.standard_normal(4)}, expected)
+
     def test_gather_with_negative_indices(self):
         indices = np.array([-1, 0], dtype=np.int64)
         model = build([helper.make_node("Gather", ["x", "i"], ["y"], axis=0)],
@@ -904,6 +924,78 @@ class ConvolutionTests(JacobianCase):
         model, feeds = self.conv([2, 2, 5, 5], [3, 2, 3, 3], [2, 3, 5, 5],
                                  differentiate="b", pads=[1, 1, 1, 1], kernel_shape=[3, 3])
         self.check(model, feeds, None, **self.TOLERANCES)
+
+
+class SecondOrderTests(JacobianCase):
+    """The passes must differentiate what they themselves emit: reverse(Gather) is a
+    ScatterND and reverse(Conv) a ConvTranspose, so forward(reverse(model)) -- the file
+    `family` writes for exact Hessians -- needs rules for both."""
+
+    def hessian_vector(self, m, feeds, weights, direction):
+        second = forward(reverse(m), inputs=["x"], outputs=["adj_x"])
+        onnx.checker.check_model(second)
+        return run(second, dict(feeds, adj_y=weights, fwd_x=direction))["fwd_adj_x"]
+
+    def finite_hessian_vector(self, m, feeds, weights, direction, step=1e-3):
+        adjoint = reverse(m)
+        grad = lambda shift: run(adjoint, dict(feeds, x=feeds["x"] + shift*direction.reshape(
+            feeds["x"].shape), adj_y=weights))["adj_x"]
+        return (grad(step) - grad(-step))/(2*step)
+
+    def test_through_a_gather(self):
+        indices = np.array([2, 0, 2], dtype=np.int64)
+        nodes = [helper.make_node("Gather", ["x", "i"], ["g"], axis=0),
+                 helper.make_node("Mul", ["g", "g"], ["y"])]
+        m = build(nodes, [("x", [4])], [("y", [3])], [numpy_helper.from_array(indices, "i")])
+        x = np.array([0.3, -0.7, 1.1, 0.5])
+        got = self.hessian_vector(m, {"x": x}, np.ones((3, 1)), np.eye(4))
+        # sum_j g_j^2 with index 2 taken twice: the Hessian is diag(2, 0, 4, 0)
+        np.testing.assert_allclose(got.reshape(4, 4), np.diag([2.0, 0, 4, 0]), atol=1e-12)
+
+    def test_through_a_convolution(self):
+        w = RNG.standard_normal((3, 2, 3, 3)).astype(np.float32)
+        nodes = [helper.make_node("Conv", ["x", "w"], ["c"], pads=[1, 1, 1, 1],
+                                  kernel_shape=[3, 3]),
+                 helper.make_node("Tanh", ["c"], ["y"])]
+        m = build(nodes, [("x", [1, 2, 4, 4])], [("y", [1, 3, 4, 4])],
+                  [numpy_helper.from_array(w, "w")], dtype=TensorProto.FLOAT)
+        feeds = {"x": RNG.standard_normal((1, 2, 4, 4)).astype(np.float32)}
+        weights = pack(RNG.standard_normal((1, 3, 4, 4, 1)).astype(np.float32), (1, 3, 4, 4))
+        direction = pack(RNG.standard_normal((1, 2, 4, 4, 1)).astype(np.float32), (1, 2, 4, 4))
+        got = self.hessian_vector(m, feeds, weights, direction)
+        want = self.finite_hessian_vector(m, feeds, weights, direction)
+        np.testing.assert_allclose(got.reshape(-1), want.reshape(-1), rtol=2e-2, atol=2e-3)
+
+    def test_scatter_nd_directly(self):
+        indices = np.array([[1], [3]], dtype=np.int64)
+        for reduction in ("none", "add"):
+            with self.subTest(reduction=reduction):
+                extra = {} if reduction == "none" else {"reduction": reduction}
+                m = build([helper.make_node("ScatterND", ["x", "i", "u"], ["y"], **extra)],
+                          [("x", [4])], [("y", [4])],
+                          [numpy_helper.from_array(indices, "i"),
+                           numpy_helper.from_array(np.array([5.0, 7.0]), "u")])
+                kept = np.diag([1.0, 0, 1, 0]) if reduction == "none" else np.eye(4)
+                self.check(m, {"x": RNG.standard_normal(4)}, kept)
+
+    def test_scatter_nd_updates(self):
+        indices = np.array([[1], [3]], dtype=np.int64)
+        m = build([helper.make_node("ScatterND", ["d", "i", "x"], ["y"])],
+                  [("x", [2])], [("y", [4])],
+                  [numpy_helper.from_array(indices, "i"),
+                   numpy_helper.from_array(np.zeros(4), "d")])
+        expected = np.zeros((4, 2))
+        expected[1, 0] = expected[3, 1] = 1
+        self.check(m, {"x": RNG.standard_normal(2)}, expected)
+
+    def test_conv_transpose(self):
+        w = RNG.standard_normal((2, 3, 3, 3)).astype(np.float32)
+        m = build([helper.make_node("ConvTranspose", ["x", "w"], ["y"], strides=[2, 2],
+                                    pads=[1, 1, 1, 1], kernel_shape=[3, 3])],
+                  [("x", [1, 2, 3, 3])], [("y", [1, 3, 5, 5])],
+                  [numpy_helper.from_array(w, "w")], dtype=TensorProto.FLOAT)
+        self.check(m, {"x": RNG.standard_normal((1, 2, 3, 3)).astype(np.float32)}, None,
+                   rtol=2e-5, step=1e-3, fd_tol=5e-3)
 
 
 class GatherNDTests(JacobianCase):

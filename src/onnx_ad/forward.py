@@ -39,15 +39,18 @@ def forward(model, inputs=None, outputs=None, prefix=None, dim=None, layout="cas
 
     unpacking = ctx.b.nodes  # seed unpacking reads graph inputs only, so it can go first
     ctx.b.nodes = []
+    # reserve the output names before any rule draws from the shared allocator
+    chosen = select(graph.output, outputs, "output")
+    reserved = {value.name: rename(ctx.b, prefix + value.name) for value in chosen}
     body = forward_nodes(ctx, list(graph.node))
 
     derivative_outputs = []
-    for value in select(graph.output, outputs, "output"):
+    for value in chosen:
         tangent = ctx.derivative.get(value.name)
         seeded = ctx.zeros(value.name) if tangent is None else ctx.full(tangent, value.name)
         if layout == "casadi":
             seeded = ctx.pack(seeded, value.name)
-        name = rename(ctx.b, prefix + value.name)
+        name = reserved[value.name]
         ctx.b.alias(seeded, name)
         derivative_outputs.append(seeded_value_info(value, name, dim, layout))
     return assemble(result, ctx, unpacking + body + ctx.b.nodes, seed_inputs,

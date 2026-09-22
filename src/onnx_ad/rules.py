@@ -1223,10 +1223,15 @@ def _gather_reverse(ctx, node, grads):
         zeros = ctx.b.op("Transpose", [zeros], perm=order + [rank], stem="a_zeros")
         seeded = ctx.b.op("Transpose", [seeded], perm=_gather_order(ctx, node, rank, axis),
                           stem="a_seeded")
-    # ScatterND rejects negative indices, which Gather accepts
-    extent = ctx.b.op("Gather", [ctx.shape_of(data), ctx.b.ints([axis])], axis=0,
+    # ScatterND rejects negative indices, which Gather accepts. Every constant here is a
+    # scalar: a [1]-shaped one would broadcast a scalar index -- what `x[2]` exports to -- up
+    # to rank 1, and ScatterND would then expect updates with an axis they do not have.
+    indices = ctx.b.op("Cast", [indices], to=TensorProto.INT64, stem="indices")
+    zero = ctx.b.constant(0, TensorProto.INT64, ())
+    extent = ctx.b.op("Gather", [ctx.shape_of(data),
+                                 ctx.b.constant(axis, TensorProto.INT64, ())], axis=0,
                       stem="extent")
-    normalized = ctx.b.op("Where", [ctx.b.op("Less", [indices, ctx.b.ints([0])]),
+    normalized = ctx.b.op("Where", [ctx.b.op("Less", [indices, zero]),
                                     ctx.b.op("Add", [indices, extent]), indices],
                           stem="positive_indices")
     scattered = ctx.b.op("ScatterND", [zeros, ctx.unsqueeze(normalized, [-1]), seeded],
@@ -1509,28 +1514,42 @@ def _conv_attributes(ctx, node):
     return attrs, spatial
 
 
-def _merge_leading(ctx, value):
+def _merge_leading(ctx, value, tail=None):
     """[a, b, rest...] -> [a*b, rest...].
+
+    `tail` is `rest` when it is statically known, which makes the target a constant any
+    version of ONNX shape inference can see through -- so a later pass differentiating this
+    model again still knows the rank. Without it the target is computed at run time.
 
     Not `Reshape` with zeros: a 0 in a reshape target copies the input's dimension at the
     *same* index, which after a merge is the wrong one -- it silently produces a tensor of
     the right size and the wrong shape.
     """
-    tail = ctx.b.op("Slice", [ctx.b.op("Shape", [value], stem="merge_shape"),
-                              ctx.b.ints([2]), ctx.b.ints([INT64_MAX])], stem="tail")
-    target = ctx.b.op("Concat", [ctx.b.ints([-1]), tail], axis=0, stem="merged_shape")
+    if tail is not None and None not in tail:
+        target = ctx.b.ints([-1] + list(tail))
+    else:
+        tail_ = ctx.b.op("Slice", [ctx.b.op("Shape", [value], stem="merge_shape"),
+                                   ctx.b.ints([2]), ctx.b.ints([INT64_MAX])], stem="tail")
+        target = ctx.b.op("Concat", [ctx.b.ints([-1]), tail_], axis=0, stem="merged_shape")
     return ctx.b.op("Reshape", [value, target], stem="merged")
 
 
-def _fold_seed_into_batch(ctx, value, rank):
+def _fold_seed_into_batch(ctx, value, primal):
     """[batch, ...spatial, nseed] -> [nseed*batch, ...spatial], one image per seed."""
-    return _merge_leading(ctx, _seed_front(ctx, value, rank))
+    static = ctx.shapes.static(primal)
+    return _merge_leading(ctx, _seed_front(ctx, value, ctx.rank(primal)),
+                          None if static is None else static[1:])
 
 
 def _unfold_batch_into_seed(ctx, value, reference, rank):
-    """The inverse, with `reference` the primal tensor whose shape the result must have."""
-    target = ctx.b.op("Concat", [ctx.b.ints([-1]), ctx.shape_of(reference)], axis=0,
-                      stem="unfold")
+    """The inverse, with `reference` the primal tensor whose shape the result must have.
+
+    A constant target where the shape is declared, for the same reason as in
+    `_merge_leading`: older shape inference cannot see through a computed one.
+    """
+    static = ctx.shapes.static(reference)
+    target = ctx.b.ints([-1] + list(static)) if static is not None else ctx.b.op(
+        "Concat", [ctx.b.ints([-1]), ctx.shape_of(reference)], axis=0, stem="unfold")
     return _seed_back(ctx, ctx.b.op("Reshape", [value, target], stem="unfolded"), rank)
 
 
@@ -1541,7 +1560,7 @@ def _conv_forward(ctx, node, tangents):
     rank = ctx.rank(x)
     terms = []
     if tangents[0] is not None:
-        folded = _fold_seed_into_batch(ctx, ctx.full(tangents[0], x), rank)
+        folded = _fold_seed_into_batch(ctx, ctx.full(tangents[0], x), x)
         product = ctx.b.op("Conv", [folded, w], stem="t_conv", **attrs)
         terms.append(_unfold_batch_into_seed(ctx, product, y, ctx.rank(y)))
     if tangents[1] is not None:
@@ -1551,7 +1570,9 @@ def _conv_forward(ctx, node, tangents):
                 "axis would have to fold into the output channels, which the groups own")
         seeded = ctx.full(tangents[1], w)
         # fold the seeds into the output channels: one filter bank per seed
-        stacked = _merge_leading(ctx, _seed_front(ctx, seeded, ctx.rank(w)))
+        static_w = ctx.shapes.static(w)
+        stacked = _merge_leading(ctx, _seed_front(ctx, seeded, ctx.rank(w)),
+                                 None if static_w is None else static_w[1:])
         product = ctx.b.op("Conv", [x, stacked], stem="t_conv_w", **attrs)
         # [batch, nseed*out, spatial...] -> [batch, out, spatial..., nseed]
         split = ctx.b.op("Reshape", [product, ctx.b.op("Concat", [
@@ -1581,7 +1602,7 @@ def _conv_reverse(ctx, node, grads):
                 "convolution knows how much of its output to keep")
         transposed = dict(attrs, output_shape=list(shape[2:]))
         transposed.pop("kernel_shape", None)
-        folded = _fold_seed_into_batch(ctx, seeded, ctx.rank(y))
+        folded = _fold_seed_into_batch(ctx, seeded, y)
         contributions[0] = _unfold_batch_into_seed(
             ctx, ctx.b.op("ConvTranspose", [folded, w], stem="a_conv", **transposed), x, rank)
     contributions.append(_conv_weight_adjoint(ctx, node, attrs, spatial, seeded))
@@ -1614,9 +1635,10 @@ def _conv_weight_adjoint(ctx, node, attrs, spatial, seeded):
         ctx, x, [0, 0] + list(pads[:spatial]), [0, 0] + list(pads[spatial:]))
     swap = [1, 0] + list(range(2, rank))
     # [batch, out, spatial..., nseed] -> [out*nseed, batch, spatial...]
+    static_y = ctx.shapes.static(node.output[0])
     filters = _merge_leading(ctx, ctx.b.op(
         "Transpose", [seeded], perm=[1, rank] + [0] + list(range(2, rank)),
-        stem="a_filters"))
+        stem="a_filters"), None if static_y is None else [static_y[0]] + list(static_y[2:]))
     product = ctx.b.op("Conv", [ctx.b.op("Transpose", [padded], perm=swap), filters],
                        strides=attrs["dilations"], dilations=attrs["strides"],
                        pads=[0]*(2*spatial), group=1, stem="a_conv_w")
@@ -1630,3 +1652,102 @@ def _conv_weight_adjoint(ctx, node, attrs, spatial, seeded):
     # [in, out, nseed, spatial...] -> [out, in, spatial..., nseed]
     return ctx.b.op("Transpose", [split],
                     perm=[1, 0] + list(range(3, 3 + spatial)) + [2], stem="a_conv_weight")
+
+
+# --- operations the passes emit, so that their output differentiates again --------------
+# The reverse of Gather and GatherND is a ScatterND, and the reverse of Conv a
+# ConvTranspose. Without rules for those two, forward(reverse(model)) -- the second-order
+# file `family` writes -- fails on any network that gathers or convolves.
+
+def _scatter_reduction(node):
+    reduction = attribute(node, "reduction", "none")
+    if reduction not in ("none", "add"):
+        raise UnsupportedOperator(
+            "ScatterND with reduction='%s' is not differentiated; only 'none' and 'add' are "
+            "linear" % reduction)
+    return reduction
+
+
+@forward_rule("ScatterND")
+def _scatter_nd_forward(ctx, node, tangents):
+    reduction = _scatter_reduction(node)
+    data, indices, updates = node.input[0], node.input[1], node.input[2]
+    seeded = [ctx.zeros(name) if tangent is None else ctx.full(tangent, name)
+              for name, tangent in ((data, tangents[0]), (updates, tangents[2]))]
+    extra = {"reduction": reduction} if reduction != "none" else {}
+    return ctx.b.op("ScatterND", [seeded[0], indices, seeded[1]], stem="t_scatternd", **extra)
+
+
+@reverse_rule("ScatterND")
+def _scatter_nd_reverse(ctx, node, grads):
+    reduction = _scatter_reduction(node)
+    data, indices, updates = node.input[0], node.input[1], node.input[2]
+    seeded = ctx.full(grads[0], node.output[0])
+    # with 'none' the scattered positions were overwritten, so none of it reaches `data`
+    to_data = seeded if reduction == "add" else ctx.b.op(
+        "ScatterND", [seeded, indices, ctx.zeros(updates)], stem="a_scatternd")
+    to_updates = ctx.b.op("GatherND", [seeded, indices], stem="a_updates")
+    return [to_data, None, to_updates]
+
+
+def _conv_transpose_pads(ctx, node, attrs, spatial):
+    """The padding a ConvTranspose actually uses: an `output_shape` overrides `pads`."""
+    shape = attribute(node, "output_shape")
+    if shape is None:
+        return list(attrs["pads"])
+    x = ctx.shapes.static(node.input[0])
+    w = ctx.shapes.static(node.input[1])
+    if x is None or w is None:
+        raise UnsupportedOperator(
+            "ConvTranspose with output_shape needs declared input and weight shapes to be "
+            "differentiated in reverse mode")
+    shape = list(shape)[-spatial:]
+    padding = list(attribute(node, "output_padding", [0]*spatial))
+    begin, end = [], []
+    for i in range(spatial):
+        total = (attrs["strides"][i]*(x[2 + i] - 1) + padding[i]
+                 + (w[2 + i] - 1)*attrs["dilations"][i] + 1 - shape[i])
+        begin.append(total - total//2)   # the spec's split when auto_pad is not SAME_UPPER
+        end.append(total//2)
+    return begin + end
+
+
+@forward_rule("ConvTranspose")
+def _conv_transpose_forward(ctx, node, tangents):
+    attrs, spatial = _conv_attributes(ctx, node)
+    if tangents[1] is not None:
+        raise UnsupportedOperator(
+            "ConvTranspose is not differentiated with respect to its weight")
+    x, w, y = node.input[0], node.input[1], node.output[0]
+    terms = []
+    if tangents[0] is not None:
+        folded = _fold_seed_into_batch(ctx, ctx.full(tangents[0], x), x)
+        extra = {key: attribute(node, key) for key in ("output_shape", "output_padding")
+                 if attribute(node, key) is not None}
+        product = ctx.b.op("ConvTranspose", [folded, w], stem="t_convt", **attrs, **extra)
+        terms.append(_unfold_batch_into_seed(ctx, product, y, ctx.rank(y)))
+    if len(tangents) > 2 and tangents[2] is not None:
+        terms.append(_as_channel(ctx, tangents[2], node))
+    return ctx.sum(terms)
+
+
+@reverse_rule("ConvTranspose")
+def _conv_transpose_reverse(ctx, node, grads):
+    """The adjoint of a transposed convolution is the convolution with the same weight."""
+    attrs, spatial = _conv_attributes(ctx, node)
+    x, w, y = node.input[0], node.input[1], node.output[0]
+    if ctx.asked_for(w):
+        raise UnsupportedOperator(
+            "ConvTranspose is not differentiated with respect to its weight")
+    seeded = ctx.full(grads[0], y)
+    contributions = [None, None]
+    if ctx.asked_for(x):
+        convolution = dict(attrs, pads=_conv_transpose_pads(ctx, node, attrs, spatial))
+        folded = _fold_seed_into_batch(ctx, seeded, y)
+        contributions[0] = _unfold_batch_into_seed(
+            ctx, ctx.b.op("Conv", [folded, w], stem="a_convt", **convolution), x, ctx.rank(x))
+    if len(node.input) > 2 and node.input[2] and ctx.asked_for(node.input[2]):
+        outside = [a for a in range(ctx.rank(y)) if a != 1]
+        contributions.append(ctx.reshape_like(
+            ctx.reduce_sum(seeded, outside, keepdims=0), node.input[2]))
+    return contributions

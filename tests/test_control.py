@@ -12,7 +12,7 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from onnx_ad import forward, reverse
+from onnx_ad import forward, reverse, unroll
 from test_ad import (IR_VERSION, JacobianCase, jacobian_forward, jacobian_reverse, run)
 
 RNG = np.random.default_rng(11)
@@ -194,6 +194,117 @@ class IfTests(JacobianCase):
         self.assertTrue(np.all(np.isfinite(fwd)) and np.all(np.isfinite(rev)))
         np.testing.assert_allclose(fwd, np.eye(3))
         np.testing.assert_allclose(rev, np.eye(3))
+
+
+def rnn_scan(inputs, steps=4, width=3, in_direction=0, out_direction=0, in_axis=0,
+             out_axis=0, with_state=True):
+    """s' = tanh(s * w + x) over the rows of xs, emitting s' each step.
+
+    `inputs` names which of s0, xs and w are model inputs (the rest are constants), so one
+    builder serves every "differentiate with respect to" case.
+    """
+    values = {"s0": RNG.standard_normal(width),
+              "w": RNG.standard_normal(width),
+              "xs": RNG.standard_normal((steps, width) if in_axis == 0 else (width, steps))}
+    if with_state:
+        body = helper.make_graph(
+            [helper.make_node("Mul", ["s", "w"], ["m"]),
+             helper.make_node("Add", ["m", "x"], ["a"]),
+             helper.make_node("Tanh", ["a"], ["s2"]),
+             helper.make_node("Identity", ["s2"], ["y"])],
+            "body", [vi("s", [width]), vi("x", [width])], [vi("s2", [width]), vi("y", [width])])
+        scan = helper.make_node("Scan", ["s0", "xs"], ["sf", "ys"], body=body,
+                                num_scan_inputs=1, scan_input_directions=[in_direction],
+                                scan_output_directions=[out_direction],
+                                scan_input_axes=[in_axis], scan_output_axes=[out_axis])
+        outputs = [vi("sf", [width]),
+                   vi("ys", [steps, width] if out_axis == 0 else [width, steps])]
+    else:  # a pure map: no state at all, so nothing to tape
+        body = helper.make_graph(
+            [helper.make_node("Mul", ["x", "w"], ["m"]), helper.make_node("Exp", ["m"], ["y"])],
+            "body", [vi("x", [width])], [vi("y", [width])])
+        scan = helper.make_node("Scan", ["xs"], ["ys"], body=body, num_scan_inputs=1)
+        outputs = [vi("ys", [steps, width])]
+    shapes = {"s0": [width], "w": [width], "xs": list(values["xs"].shape)}
+    m = model([scan], [vi(name, shapes[name]) for name in inputs], outputs,
+              [const(name, value) for name, value in values.items()
+               if name not in inputs and (with_state or name != "s0")])
+    return m, {name: values[name] for name in inputs}
+
+
+class ScanTests(JacobianCase):
+    """Forward is one Scan with the tangent as extra state; reverse tapes the state and
+    sweeps backwards. Every case is also checked against the unrolled graph."""
+
+    def check_scan(self, m, feeds, x, y):
+        flat = unroll(m)
+        self.assertNotIn("Scan", [node.op_type for node in flat.graph.node])
+        # one input and one output at a time: a model with several would want every seed
+        pair = dict(inputs=[x], outputs=[y])
+        reference = jacobian_forward(flat, feeds, x, y, **pair)
+        self.check(m, feeds, reference, x=x, y=y, fd_tol=1e-5, **pair)
+
+    def test_with_respect_to_the_scanned_input(self):
+        m, feeds = rnn_scan(["xs"])
+        for y in ("ys", "sf"):
+            with self.subTest(output=y):
+                self.check_scan(m, feeds, "xs", y)
+
+    def test_with_respect_to_the_initial_state(self):
+        m, feeds = rnn_scan(["s0"])
+        for y in ("ys", "sf"):
+            with self.subTest(output=y):
+                self.check_scan(m, feeds, "s0", y)
+
+    def test_with_respect_to_a_captured_weight(self):
+        # w is read inside the body every iteration: its adjoint accumulates in the state
+        m, feeds = rnn_scan(["w"])
+        for y in ("ys", "sf"):
+            with self.subTest(output=y):
+                self.check_scan(m, feeds, "w", y)
+
+    def test_everything_at_once(self):
+        m, feeds = rnn_scan(["s0", "xs", "w"])
+        for x in ("s0", "xs", "w"):
+            with self.subTest(input=x):
+                self.check_scan(m, feeds, x, "ys")
+
+    def test_reversed_directions(self):
+        for in_direction in (0, 1):
+            for out_direction in (0, 1):
+                with self.subTest(input=in_direction, output=out_direction):
+                    m, feeds = rnn_scan(["xs", "w"], in_direction=in_direction,
+                                        out_direction=out_direction)
+                    self.check_scan(m, feeds, "xs", "ys")
+                    self.check_scan(m, feeds, "w", "ys")
+
+    def test_scan_axes_other_than_zero(self):
+        m, feeds = rnn_scan(["xs"], in_axis=1, out_axis=1)
+        self.check_scan(m, feeds, "xs", "ys")
+
+    def test_a_map_without_state(self):
+        m, feeds = rnn_scan(["xs"], with_state=False)
+        self.check_scan(m, feeds, "xs", "ys")
+
+    def test_a_constant_initial_state_picks_up_a_tangent(self):
+        # s0 is a constant, but the body mixes xs into it: the state carries a tangent from
+        # the second iteration on, which only the loop-carried fixed point discovers
+        m, feeds = rnn_scan(["xs"])
+        self.check_scan(m, feeds, "xs", "sf")
+
+    def test_forward_over_adjoint_through_a_scan(self):
+        m, feeds = rnn_scan(["xs"], steps=3, width=2)
+        adjoint = reverse(m, outputs=["sf"])
+        second = forward(adjoint, inputs=["xs"], outputs=["adj_xs"])
+        onnx.checker.check_model(second)
+        flat = forward(reverse(unroll(m), outputs=["sf"]), inputs=["xs"], outputs=["adj_xs"])
+        weights = np.array([[1.0], [-0.5]])
+        directions = RNG.standard_normal((3, 2))
+        feeds_ = dict(feeds, adj_sf=weights,
+                      fwd_xs=np.ascontiguousarray(directions[:, None, :].reshape(3, 2)))
+        got = run(second, feeds_)["fwd_adj_xs"]
+        want = run(flat, feeds_)["fwd_adj_xs"]
+        np.testing.assert_allclose(got, want, rtol=1e-11, atol=1e-12)
 
 
 if __name__ == "__main__":

@@ -50,6 +50,9 @@ def reverse(model, inputs=None, outputs=None, prefix=None, dim=None, layout="cas
     # unpacking may read the shape of a primal output, so it goes after the primal graph
     unpacking = ctx.b.nodes
     ctx.b.nodes = []
+    # reserve the output names now: the allocator is shared with every rule, and a rule
+    # that took `adj_<x>` first would leave the convention nothing to name the output
+    reserved = {value.name: rename(ctx.b, prefix + value.name) for value in differentiated}
 
     primal, adjoint, results = reverse_nodes(ctx, list(graph.node), seeds,
                                              [value.name for value in differentiated])
@@ -60,7 +63,7 @@ def reverse(model, inputs=None, outputs=None, prefix=None, dim=None, layout="cas
         seeded = ctx.zeros(value.name) if adjoint_ is None else ctx.full(adjoint_, value.name)
         if layout == "casadi":
             seeded = ctx.pack(seeded, value.name)
-        name = rename(ctx.b, prefix + value.name)
+        name = reserved[value.name]
         ctx.b.alias(seeded, name)
         derivative_outputs.append(seeded_value_info(value, name, dim, layout))
     return assemble(result, ctx, primal + unpacking + adjoint + ctx.b.nodes, seed_inputs,
