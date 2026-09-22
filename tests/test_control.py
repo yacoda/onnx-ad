@@ -35,6 +35,15 @@ def const(name, value):
     return numpy_helper.from_array(np.asarray(value), name)
 
 
+def onnx_shape(m, name):
+    """The shape ONNX's own inference gives a value, or None."""
+    inferred = onnx.shape_inference.infer_shapes(m)
+    for value in list(inferred.graph.value_info) + list(inferred.graph.output):
+        if value.name == name and value.type.tensor_type.HasField("shape"):
+            return [d.dim_value for d in value.type.tensor_type.shape.dim]
+    return None
+
+
 def branch(nodes, outputs, name):
     return helper.make_graph(nodes, name, [], outputs)
 
@@ -451,6 +460,25 @@ class LoopTests(JacobianCase):
             with self.subTest(trips=trips):
                 self.check(m, {"v0": v0, "trips": np.array(trips, dtype=np.int64)}, expected,
                            x="v0", y="vf", differences=False)
+
+    def test_values_after_a_loop_keep_their_rank(self):
+        # ONNX shape inference leaves a Loop's carried outputs unshaped, and with them
+        # everything downstream -- here the ReduceSum, whose adjoint needs its input's rank
+        body = helper.make_graph(
+            [helper.make_node("Mul", ["v", "w"], ["m"]), helper.make_node("Tanh", ["m"], ["v2"]),
+             helper.make_node("Identity", ["c"], ["c2"])],
+            "body", [vi("i", [], TensorProto.INT64), vi("c", [], TensorProto.BOOL),
+                     vi("v", [3])], [vi("c2", [], TensorProto.BOOL), vi("v2", [3])])
+        nodes = [helper.make_node("Loop", ["trips", "", "x"], ["vf"], body=body),
+                 helper.make_node("Mul", ["vf", "vf"], ["sq"]),
+                 helper.make_node("ReduceSum", ["sq"], ["y"], keepdims=0)]
+        m = model(nodes, [vi("x", [3])], [vi("y", [])],
+                  [const("trips", np.array(3, dtype=np.int64)),
+                   const("w", RNG.standard_normal(3))])
+        self.assertIsNone(onnx_shape(m, "sq"))  # the gap this test is about
+        feeds = {"x": RNG.standard_normal(3)}
+        reference = jacobian_forward(unroll(m), feeds, "x", "y")
+        self.check(m, feeds, reference, x="x", y="y", fd_tol=1e-5)
 
     def test_forward_over_adjoint_through_a_loop(self):
         m, feeds = for_loop(["x"], trips=3, width=2, scan_output=False)

@@ -114,11 +114,15 @@ class Shapes:
     """Element type, rank and (where declared) static shape of every value in a graph."""
 
     def __init__(self, model):
-        try:
-            from onnx import shape_inference
-            inferred = shape_inference.infer_shapes(model, strict_mode=False)
-        except Exception:  # shape inference is a convenience, never a requirement
-            inferred = model
+        inferred = _infer(model)
+        # ONNX inference can leave a control-flow node's outputs without a shape -- a Loop's
+        # carried outputs, typically -- and then everything downstream of it too. Fill those
+        # in from the node's inputs and body, and let inference propagate from there.
+        for _ in range(4):
+            hinted = _control_flow_hints(model, inferred)
+            if hinted is None:
+                break
+            model, inferred = hinted, _infer(hinted)
         self._type = {}
         self._shape = {}
         for tensor in model.graph.initializer:
@@ -168,6 +172,87 @@ class Shapes:
         """The declared shape when every dimension is known, else None."""
         shape = self._shape.get(name)
         return shape if shape is not None and None not in shape else None
+
+
+def _infer(model):
+    try:
+        from onnx import shape_inference
+        return shape_inference.infer_shapes(model, strict_mode=False)
+    except Exception:  # shape inference is a convenience, never a requirement
+        return model
+
+
+def _declared(model):
+    """Every value's (elem_type, dims) as far as `model` declares or has inferred it."""
+    known = {}
+    for graph in walk(model.graph):
+        for tensor in graph.initializer:
+            known[tensor.name] = (tensor.data_type, list(tensor.dims))
+        for value in list(graph.input) + list(graph.output) + list(graph.value_info):
+            kind = value.type.tensor_type
+            if kind.elem_type and kind.HasField("shape"):
+                known[value.name] = (kind.elem_type, [
+                    d.dim_value if d.WhichOneof("value") == "dim_value" else
+                    (d.dim_param or None) for d in kind.shape.dim])
+    return known
+
+
+def _control_flow_hints(model, inferred):
+    """A copy of `model` with value_info for control-flow outputs inference left unshaped,
+    or None when there is nothing to add."""
+    known = _declared(inferred)
+    result = type(model)()
+    result.CopyFrom(model)
+    added = False
+    for graph in walk(result.graph):
+        for node in graph.node:
+            for name, hint in _node_hints(node, known).items():
+                if name and name not in known and hint is not None:
+                    graph.value_info.append(helper.make_tensor_value_info(name, *hint))
+                    known[name] = hint
+                    added = True
+    return result if added else None
+
+
+def _node_hints(node, known):
+    """(elem_type, dims) for a Loop's, Scan's or If's outputs, from its operands and body."""
+    def of(name):
+        return known.get(name)
+
+    def stacked(slice_, axis, extent=None):
+        if slice_ is None:
+            return None
+        dims = list(slice_[1])
+        dims.insert(axis % (len(dims) + 1), extent)
+        return slice_[0], dims
+
+    hints = {}
+    if node.op_type == "If":
+        branch = attribute(node, "then_branch")
+        for name, value in zip(node.output, branch.output):
+            hints[name] = of(value.name)
+    elif node.op_type == "Loop":
+        body = attribute(node, "body")
+        n = len(node.input) - 2
+        for j, name in enumerate(node.output):
+            if j < n:
+                hints[name] = of(node.input[2 + j]) or of(body.output[1 + j].name)
+            else:
+                hints[name] = stacked(of(body.output[1 + j].name), 0)
+    elif node.op_type == "Scan":
+        body = attribute(node, "body")
+        m = attribute(node, "num_scan_inputs")
+        n = len(node.input) - m
+        axes = list(attribute(node, "scan_output_axes") or [0]*(len(node.output) - n))
+        first = of(node.input[n])
+        in_axis = (attribute(node, "scan_input_axes") or [0])[0]
+        extent = first[1][in_axis % len(first[1])] if first and first[1] else None
+        for j, name in enumerate(node.output):
+            if j < n:
+                hints[name] = of(node.input[j]) or of(body.output[j].name)
+            else:
+                hints[name] = stacked(of(body.output[j].name), axes[j - n], extent)
+    return hints
 
 
 class Context:
