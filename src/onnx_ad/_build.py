@@ -331,6 +331,10 @@ class Context:
     def rank(self, name):
         return self.shapes.rank(name)
 
+    def is_float(self, name):
+        """Whether a value can carry a derivative; unknown types are assumed to."""
+        return self.shapes.dtype(name) in FLOAT_TYPES
+
     def constant(self, value, dtype):
         return self.b.constant(value, dtype)
 

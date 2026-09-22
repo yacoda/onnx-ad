@@ -113,12 +113,25 @@ def unpack(packed, shape, count):
     return packed.reshape(tuple(shape) + (count,))
 
 
+def assert_closed(derivative):
+    """Every operation in a derivative model -- subgraphs included -- must have rules of its
+    own, or the model could not be differentiated again. This is what 0.1.0 lacked: the
+    reverse of Conv emitted a ConvTranspose, which had none."""
+    from onnx_ad._graph import walk
+    from onnx_ad.rules import FORWARD, REVERSE
+    missing = {node.op_type for graph in walk(derivative.graph) for node in graph.node
+               if node.op_type != "Constant"
+               and (node.op_type not in FORWARD or node.op_type not in REVERSE)}
+    assert not missing, "derivative model uses operations without rules: %s" % sorted(missing)
+
+
 def jacobian_forward(model, feeds, x, y, **options):
     """The dense Jacobian d y/d x, from one evaluation with an identity seed matrix."""
     in_shape, out_shape = shape_of(model, x), shape_of(model, y)
     n = int(np.prod(in_shape, dtype=int))
     seeds = np.eye(n, dtype=numpy_of(model, x)).reshape(in_shape + (n,))
     derivative = forward(model, **options)
+    assert_closed(derivative)
     layout = options.get("layout", "casadi")
     fed = pack(seeds, in_shape) if layout == "casadi" else seeds
     out = run(derivative, dict(feeds, **{"fwd_" + x: fed}))["fwd_" + y]
@@ -133,6 +146,7 @@ def jacobian_reverse(model, feeds, x, y, **options):
     m = int(np.prod(out_shape, dtype=int))
     seeds = np.eye(m, dtype=numpy_of(model, y)).reshape(out_shape + (m,))
     derivative = reverse(model, **options)
+    assert_closed(derivative)
     layout = options.get("layout", "casadi")
     fed = pack(seeds, out_shape) if layout == "casadi" else seeds
     out = run(derivative, dict(feeds, **{"adj_" + y: fed}))["adj_" + x]
@@ -374,6 +388,22 @@ class MatMulTests(JacobianCase):
         model = build([helper.make_node("MatMul", ["x", "x"], ["y"])],
                       [("x", [3, 3])], [("y", [3, 3])])
         self.check(model, {"x": RNG.standard_normal((3, 3))}, None, fd_tol=1e-5)
+
+
+class CastLikeTests(JacobianCase):
+    def test_a_scalar_typed_like_a_differentiated_value(self):
+        # how exporters write `x * 2.0`: the tangent reaches CastLike's type operand only
+        nodes = [helper.make_node("CastLike", ["two", "x"], ["c"]),
+                 helper.make_node("Mul", ["x", "c"], ["y"])]
+        model = build(nodes, [("x", [3])], [("y", [3])],
+                      [numpy_helper.from_array(np.array(2.0, dtype=np.float32), "two")])
+        self.check(model, {"x": RNG.standard_normal(3)}, 2*np.eye(3))
+
+    def test_cast_like_on_the_differentiated_value(self):
+        nodes = [helper.make_node("CastLike", ["x", "ref"], ["y"])]
+        model = build(nodes, [("x", [3])], [("y", [3])],
+                      [numpy_helper.from_array(np.zeros(1), "ref")])
+        self.check(model, {"x": RNG.standard_normal(3)}, np.eye(3))
 
 
 class StructuralTests(JacobianCase):

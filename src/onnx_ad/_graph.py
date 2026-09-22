@@ -5,6 +5,7 @@ them as inputs. Two consequences run through everything here: a node's real oper
 its explicit inputs *plus* whatever its subgraphs capture, and a derivative of an outer value
 needs no plumbing into a subgraph at all -- it is simply in scope there.
 """
+import numpy as np
 from onnx import AttributeProto, numpy_helper, helper
 
 
@@ -44,12 +45,17 @@ def node_reads(node):
     return reads
 
 
-def reachable(nodes, live):
-    """Values downstream of `live` within a node list (a forward dependency sweep)."""
+def reachable(nodes, live, keep=None):
+    """Values downstream of `live` within a node list (a forward dependency sweep).
+
+    `keep` filters which outputs join: for differentiation only floating-point values do,
+    since `Shape(x)` is an integer that no derivative flows through, and everything computed
+    from it -- a `ConstantOfShape` mask, a `Range` -- would otherwise look differentiated.
+    """
     live = set(live)
     for node in nodes:
         if node_reads(node) & live:
-            live.update(name for name in node.output if name)
+            live.update(name for name in node.output if name and (keep is None or keep(name)))
     return live
 
 
@@ -84,8 +90,25 @@ def all_constants(graph):
             values[tensor.name] = numpy_helper.to_array(tensor)
         for node in scope.node:
             if node.op_type == "Constant":
-                tensor = next((helper.get_attribute_value(a) for a in node.attribute
-                               if a.name == "value"), None)
-                if tensor is not None:
-                    values[node.output[0]] = numpy_helper.to_array(tensor)
+                value = constant_value(node)
+                if value is not None:
+                    values[node.output[0]] = value
     return values
+
+
+def constant_value(node):
+    """A Constant node's value as a numpy array, in any of its spellings -- `value`, and
+    the `value_int(s)`/`value_float(s)` forms function bodies favour -- else None."""
+    for attribute in node.attribute:
+        value = helper.get_attribute_value(attribute)
+        if attribute.name == "value":
+            return numpy_helper.to_array(value)
+        if attribute.name == "value_int":
+            return np.array(value, dtype=np.int64)
+        if attribute.name == "value_ints":
+            return np.array(list(value), dtype=np.int64)
+        if attribute.name == "value_float":
+            return np.array(value, dtype=np.float32)
+        if attribute.name == "value_floats":
+            return np.array(list(value), dtype=np.float32)
+    return None

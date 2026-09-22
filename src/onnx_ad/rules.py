@@ -606,6 +606,10 @@ ZERO_DERIVATIVE = (
     "And", "Or", "Xor", "Not", "BitwiseAnd", "BitwiseOr", "BitwiseXor", "BitwiseNot",
     "ArgMax", "ArgMin", "IsNaN", "IsInf", "IsFinite", "Sign", "Floor", "Ceil", "Round",
     "Hardmax", "OneHot", "Bernoulli", "Multinomial", "Det",
+    # outputs that depend on an operand's shape or type but not its values
+    "ConstantOfShape", "EyeLike", "RandomNormalLike", "RandomUniformLike",
+    # integer or boolean results, or a reinterpretation of the bits
+    "NonMaxSuppression", "QuantizeLinear", "BitCast",
 )
 
 
@@ -627,7 +631,11 @@ def _cast_target(ctx, node):
 
 @forward_rule("Cast", "CastLike")
 def _cast_forward(ctx, node, tangents):
-    # float to float carries the tangent across; anything through an integer type loses it
+    # float to float carries the tangent across; anything through an integer type loses it.
+    # CastLike's second operand only names a type: a tangent reaching it -- `CastLike(2.0, x)`
+    # with x differentiated, which is how exporters type a scalar -- carries nothing through.
+    if tangents[0] is None:
+        return None
     target = _cast_target(ctx, node)
     if target not in FLOAT_TYPES or ctx.shapes.dtype(node.input[0]) not in FLOAT_TYPES:
         return None
@@ -638,7 +646,8 @@ def _cast_forward(ctx, node, tangents):
 def _cast_reverse(ctx, node, grads):
     source = ctx.shapes.dtype(node.input[0])
     rest = [None]*(len(node.input) - 1)
-    if _cast_target(ctx, node) not in FLOAT_TYPES or source not in FLOAT_TYPES:
+    if not ctx.asked_for(node.input[0]) or _cast_target(ctx, node) not in FLOAT_TYPES \
+            or source not in FLOAT_TYPES:
         return [None] + rest
     return [ctx.b.op("Cast", [grads[0]], to=source)] + rest
 
@@ -1750,3 +1759,100 @@ def _conv_transpose_reverse(ctx, node, grads):
         contributions.append(ctx.reshape_like(
             ctx.reduce_sum(seeded, outside, keepdims=0), node.input[2]))
     return contributions
+
+
+# --- element-wise indexing ------------------------------------------------------------------
+# GatherElements and ScatterElements address every element through an index tensor of the
+# data's own rank, so the seed axis needs an index of its own: the same index, repeated along
+# it. Both accept negative indices, so no normalization is needed.
+
+def _seeded_indices(ctx, indices):
+    """`indices` with a trailing seed axis, each seed direction addressed identically."""
+    return ctx.b.op("Expand", [ctx.unsqueeze(indices, [-1]), ctx.seeded_shape(indices)],
+                    stem="seeded_indices")
+
+
+@forward_rule("GatherElements")
+def _gather_elements_forward(ctx, node, tangents):
+    data, indices = node.input[0], node.input[1]
+    axis = attribute(node, "axis", 0) % ctx.rank(data)
+    return ctx.b.op("GatherElements", [ctx.full(tangents[0], data),
+                                       _seeded_indices(ctx, indices)], axis=axis,
+                    stem="t_gatherelements")
+
+
+@reverse_rule("GatherElements")
+def _gather_elements_reverse(ctx, node, grads):
+    """A scatter-add of the adjoint into a zero tensor: repeated indices accumulate."""
+    if ctx.opset < 16:
+        raise UnsupportedOperator(
+            "GatherElements needs ScatterElements with reduction='add' (opset 16) to be "
+            "differentiated in reverse; re-export at opset 16 or later")
+    data, indices = node.input[0], node.input[1]
+    axis = attribute(node, "axis", 0) % ctx.rank(data)
+    return [ctx.b.op("ScatterElements", [ctx.zeros(data), _seeded_indices(ctx, indices),
+                                         ctx.full(grads[0], node.output[0])],
+                     axis=axis, reduction="add", stem="a_gatherelements"), None]
+
+
+@forward_rule("ScatterElements", "Scatter")
+def _scatter_elements_forward(ctx, node, tangents):
+    reduction = _scatter_reduction(node)
+    data, indices, updates = node.input[0], node.input[1], node.input[2]
+    axis = attribute(node, "axis", 0) % ctx.rank(data)
+    seeded = [ctx.zeros(name) if tangent is None else ctx.full(tangent, name)
+              for name, tangent in ((data, tangents[0]), (updates, tangents[2]))]
+    extra = {"reduction": reduction} if reduction != "none" else {}
+    return ctx.b.op(node.op_type, [seeded[0], _seeded_indices(ctx, indices), seeded[1]],
+                    axis=axis, stem="t_scatterelements", **extra)
+
+
+@reverse_rule("ScatterElements", "Scatter")
+def _scatter_elements_reverse(ctx, node, grads):
+    reduction = _scatter_reduction(node)
+    data, indices, updates = node.input[0], node.input[1], node.input[2]
+    axis = attribute(node, "axis", 0) % ctx.rank(data)
+    seeded = ctx.full(grads[0], node.output[0])
+    index = _seeded_indices(ctx, indices)
+    # with 'none' the scattered positions were overwritten, so none of it reaches the data
+    to_data = seeded if reduction == "add" else ctx.b.op(
+        node.op_type, [seeded, index, ctx.zeros(updates)], axis=axis, stem="a_scatter")
+    to_updates = ctx.b.op("GatherElements", [seeded, index], axis=axis, stem="a_updates")
+    return [to_data, None, to_updates]
+
+
+# --- Range -------------------------------------------------------------------------------
+# start + delta * i for i = 0, 1, ...: linear in start and delta. Most Ranges are integer and
+# never differentiated; the rule matters because without one a Range would be expanded into
+# its spec body -- a Loop -- which is slower, and not a faithful drop-in when `start` is a
+# one-element tensor rather than a scalar.
+
+def _range_index(ctx, node):
+    y = node.output[0]
+    dtype = ctx.dtype(y)
+    count = ctx.b.op("Size", [y], stem="range_count")
+    steps = ctx.b.op("Range", [ctx.b.constant(0, TensorProto.INT64, ()), count,
+                               ctx.b.constant(1, TensorProto.INT64, ())], stem="range_steps")
+    return ctx.b.op("Cast", [steps], to=dtype, stem="range_index")
+
+
+@forward_rule("Range")
+def _range_forward(ctx, node, tangents):
+    terms = []
+    if tangents[0] is not None:  # d/d start: every element moves with it
+        terms.append(tangents[0])
+    if tangents[2] is not None:  # d/d delta: element i moves i times as far
+        terms.append(ctx.b.op("Mul", [ctx.lift(_range_index(ctx, node)), tangents[2]]))
+    total = ctx.sum(terms)
+    return None if total is None else ctx.full(total, node.output[0])
+
+
+@reverse_rule("Range")
+def _range_reverse(ctx, node, grads):
+    seeded = ctx.full(grads[0], node.output[0])
+    to_start = ctx.reduce_sum(seeded, [0], keepdims=0) if ctx.asked_for(node.input[0]) else None
+    to_delta = None
+    if len(node.input) > 2 and ctx.asked_for(node.input[2]):
+        to_delta = ctx.reduce_sum(ctx.b.op("Mul", [seeded, ctx.lift(_range_index(ctx, node))]),
+                                  [0], keepdims=0)
+    return [to_start, None, to_delta]

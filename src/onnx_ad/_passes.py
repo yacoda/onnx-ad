@@ -66,7 +66,7 @@ def reverse_nodes(ctx, nodes, seeds, differentiated):
     a rule asked for), the adjoint node list, and the summed contributions to values the
     list does not itself define -- its inputs and captured outer values.
     """
-    depends = reachable(nodes, differentiated)
+    depends = reachable(nodes, differentiated, keep=ctx.is_float)
     ctx.depends = depends
     ctx._replacements = {}
     ctx.b.nodes = []
