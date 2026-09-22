@@ -2,3 +2,11 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# LaTeX build products
+*.aux
+*.log
+*.nav
+*.out
+*.snm
+*.toc

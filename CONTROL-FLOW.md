@@ -1,6 +1,7 @@
 # Differentiating control flow — design brief
 
 *Status: design only. `If`, `Scan` and `Loop` have no rules yet.*
+*Slides: [`docs/slides/slides.pdf`](docs/slides/slides.pdf) — the same argument as pictures.*
 
 The three operations are worth taking in the order `If`, `Scan`, `Loop`, because each adds
 exactly one capability the previous one did not need, and the third gets most of its answer

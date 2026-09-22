@@ -1,0 +1,380 @@
+% cstheme.sty
+% Presentation theme for the CCTA 2026 CasADi session.
+% Requires LuaLaTeX (fontspec).  Palette derives from the KU Leuven / MECO
+% house style of the original Impress deck; typography is Lato + DejaVu Sans
+% Mono + Latin Modern Math.
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{cstheme}[2026/08/11 CasADi tutorial theme]
+\newcommand{\cstitlechips}{}
+\newcommand{\setcstitlechips}[1]{\renewcommand{\cstitlechips}{#1}}
+
+\RequirePackage{fontspec}
+\RequirePackage{unicode-math}
+\RequirePackage{tikz}
+\RequirePackage[most]{tcolorbox}
+\RequirePackage{listings}
+\RequirePackage{xcolor}
+\RequirePackage[absolute,overlay]{textpos}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds,shadows.blur,
+                decorations.pathreplacing,shapes.geometric,tikzmark}
+
+% =============================================================== palette =====
+\definecolor{csTeal}  {HTML}{1D8DB0}   % primary (from the deck)
+\definecolor{csDeep}  {HTML}{0E4C61}   % dark teal, headings
+\definecolor{csDark}  {HTML}{08313F}   % darkest, title-slide ground
+\definecolor{csInk}   {HTML}{16232B}   % body text
+\definecolor{csMuted} {HTML}{6E8290}   % secondary text
+\definecolor{csRule}  {HTML}{CBD9E2}   % hairlines
+\definecolor{csWash}  {HTML}{EEF4F8}   % card background
+\definecolor{csRed}   {HTML}{B3121B}   % CasADi red, used sparingly
+\definecolor{csAmber} {HTML}{D08A17}   % secondary accent
+\definecolor{csGreen} {HTML}{2E8B72}   % "good" accent
+% Terminal output.  The original deck printed program output in grey, the same
+% grey it used to de-emphasise; grey stays for de-emphasis only, and output gets
+% a ground of its own so the two can never be confused.
+\definecolor{csTermBg}{HTML}{0B2E3A}
+\definecolor{csTermFg}{HTML}{DCEAEF}
+\definecolor{csTermAc}{HTML}{63C6E3}
+
+\setbeamercolor{normal text}{fg=csInk,bg=white}
+\setbeamercolor{structure}{fg=csTeal}
+\setbeamercolor{alerted text}{fg=csRed}
+\setbeamercolor{background canvas}{bg=white}
+\setbeamercolor{itemize item}{fg=csTeal}
+
+% ================================================================= fonts =====
+\setsansfont{Lato}[
+  UprightFont=*-Regular, ItalicFont=*-Italic,
+  BoldFont=*-Bold,       BoldItalicFont=*-BoldItalic,
+  Numbers={Lining,Proportional}]
+\newfontfamily\latolight{Lato}[UprightFont=*-Light,ItalicFont=*-LightItalic,
+  BoldFont=*-Regular,Numbers={Lining,Proportional}]
+\newfontfamily\latosemi{Lato}[UprightFont=*-Semibold,ItalicFont=*-SemiboldItalic,
+  BoldFont=*-Bold,Numbers={Lining,Proportional}]
+\newfontfamily\latoblack{Lato}[UprightFont=*-Black,BoldFont=*-Black]
+\setmonofont{DejaVu Sans Mono}[Scale=MatchLowercase]
+\setmathfont{Latin Modern Math}
+\renewcommand{\familydefault}{\sfdefault}
+
+\newcommand{\numfont}{\addfontfeature{Numbers={Lining,Monospaced}}}
+
+% Slides do not hyphenate; short ragged lines read better than broken words.
+\hyphenpenalty=10000 \exhyphenpenalty=10000 \tolerance=2000
+\frenchspacing   % no extra space after ':' etc., as in the Impress original
+
+% Type scale for a 160mm x 90mm frame.
+\renewcommand{\tiny}        {\fontsize{6.4}{8}\selectfont}
+\renewcommand{\scriptsize}  {\fontsize{7.2}{9}\selectfont}
+\renewcommand{\footnotesize}{\fontsize{8}{10.5}\selectfont}
+\renewcommand{\small}       {\fontsize{8.8}{11.5}\selectfont}
+\renewcommand{\normalsize}  {\fontsize{10}{13.5}\selectfont}
+\renewcommand{\large}       {\fontsize{12}{15}\selectfont}
+\renewcommand{\Large}       {\fontsize{14}{17}\selectfont}
+\renewcommand{\LARGE}       {\fontsize{17}{20}\selectfont}
+\renewcommand{\huge}        {\fontsize{21}{25}\selectfont}
+\renewcommand{\Huge}        {\fontsize{26}{30}\selectfont}
+
+\setbeamerfont{title}{size=\fontsize{21}{25}\selectfont}
+\setbeamerfont{subtitle}{size=\fontsize{11}{14}\selectfont}
+\setbeamerfont{author}{size=\fontsize{9}{12}\selectfont}
+\setbeamerfont{date}{size=\fontsize{8}{10}\selectfont}
+\setbeamerfont{frametitle}{size=\fontsize{14.5}{17}\selectfont}
+\setbeamerfont{framesubtitle}{size=\fontsize{8.6}{10.5}\selectfont}
+\setbeamerfont{normal text}{size=\fontsize{10}{13.5}\selectfont}
+\setbeamerfont{footline}{size=\fontsize{6.4}{8}\selectfont}
+
+% ============================================================ frame chrome ===
+\setbeamertemplate{navigation symbols}{}
+\setbeamercolor{frametitle}{fg=csDeep}
+\setbeamercolor{framesubtitle}{fg=csMuted}
+
+\newlength{\csmargin}\setlength{\csmargin}{9mm}
+% Same margin, but carrying stretch, for the ragged-right frame title.  It has
+% to be ONE register: beamercolorbox does \rightskip=<value>, and TeX cannot
+% take glue components after a skip register, so "rightskip=\csmargin plus 1fil"
+% ends the scan at \csmargin and typesets "plus 1fil" as text before the title.
+\newlength{\csmarginfil}\setlength{\csmarginfil}{9mm plus 1fil}
+\setbeamersize{text margin left=\csmargin,text margin right=\csmargin}
+
+\makeatletter
+\setbeamertemplate{frametitle}{%
+  \vspace*{3.0mm}%
+  % raggedright: a title that wraps must not get stretched word spacing
+  \begin{beamercolorbox}[wd=\paperwidth,leftskip=\csmargin,
+                         rightskip=\csmarginfil]{frametitle}%
+    {\latosemi\usebeamerfont{frametitle}\insertframetitle}%
+    \ifx\insertframesubtitle\@empty\else
+      \\[0.4mm]{\latolight\usebeamerfont{framesubtitle}\color{csMuted}\insertframesubtitle}%
+    \fi
+  \end{beamercolorbox}%
+  \vspace*{1.0mm}\par\hspace*{\csmargin}%
+  \begin{tikzpicture}
+    \fill[csRule] (0,0) rectangle (\dimexpr\paperwidth-2\csmargin\relax,0.35pt);
+    \fill[csTeal] (0,-0.2pt) rectangle (7mm,0.55pt);
+  \end{tikzpicture}%
+  \par\vspace*{1.6mm}%
+}
+\makeatother
+
+\newcommand{\csfootlabel}{}
+\newcommand{\setcsfootlabel}[1]{\renewcommand{\csfootlabel}{#1}}
+\newlength{\csprogress}
+\setbeamertemplate{footline}{%
+  \setlength{\csprogress}{0pt}%
+  \ifnum\inserttotalframenumber>0
+    \setlength{\csprogress}{\dimexpr\paperwidth*\insertframenumber/\inserttotalframenumber\relax}%
+  \fi
+  \hbox{}\vskip-1.4mm%
+  \hspace*{\csmargin}%
+  \makebox[\dimexpr\paperwidth-2\csmargin\relax][s]{%
+    {\latolight\usebeamerfont{footline}\color{csMuted}\csfootlabel}\hfill
+    {\latolight\usebeamerfont{footline}\color{csMuted}\numfont\insertframenumber}%
+  }\par\vspace*{0.8mm}%
+  \begin{tikzpicture}
+    \fill[csRule] (0,0) rectangle (\paperwidth,1.1pt);
+    \fill[csTeal] (0,0) rectangle (\csprogress,1.1pt);
+  \end{tikzpicture}%
+}
+
+% ============================================================ text styles ====
+\newcommand{\lead}[1]{{\latolight\Large\color{csDeep}#1}}
+\newcommand{\muted}[1]{{\color{csMuted}#1}}
+\newcommand{\keyw}[1]{{\latosemi\color{csDeep}#1}}
+\newcommand{\hilite}[1]{{\latosemi\color{csTeal}#1}}
+\newcommand{\alertw}[1]{{\latosemi\color{csRed}#1}}
+
+% Chip on the dark title ground.
+\newcommand{\cstitlechip}[1]{%
+  \tikz[baseline=(n.base)]{\node[draw=white!30!csTeal,line width=0.4pt,text=white!80!csTeal,
+    rounded corners=1.8pt,inner xsep=3.6pt,inner ysep=2.2pt,font=\latosemi\scriptsize] (n) {#1};}}
+
+\newcommand{\chip}[2][csTeal]{%
+  \tikz[baseline=(n.base)]{\node[fill=#1!12,text=#1!85!black,rounded corners=1.6pt,
+    inner xsep=3.2pt,inner ysep=1.8pt,font=\latosemi\tiny] (n) {#2};}}
+
+\setbeamertemplate{itemize item}{\raisebox{0.28ex}{\tikz{\fill[csTeal](0,0)circle(1.05pt);}}}
+\setbeamertemplate{itemize subitem}{\raisebox{0.28ex}{\tikz{\draw[csTeal,line width=0.5pt](0,0)circle(1.05pt);}}}
+\setlength{\leftmargini}{3.8mm}
+\newenvironment{cslist}[1][0.9]
+  {\begin{itemize}\setlength{\itemsep}{#1\baselineskip}\setlength{\parskip}{0pt}}
+  {\end{itemize}}
+
+% Horizontal position of a word inside a run of text, measured in the font the
+% text is actually set in.  Used to anchor annotation arrows to a word without
+% relying on \tikzmarknode (which mis-reports inside a TikZ node, because node
+% contents are typeset into a box before the box is placed).
+%   \csxmid{<length>}{<font>}{<text before the word>}{<the word>}
+\newlength{\cstmpa}\newlength{\cstmpb}
+\newcommand{\csxmid}[4]{%
+  \begingroup #2\relax
+    \settowidth{\cstmpa}{#3}\settowidth{\cstmpb}{#4}%
+    \global#1=\dimexpr\cstmpa+0.5\cstmpb\relax
+  \endgroup}
+
+\newcommand{\cscheck}{\tikz[baseline]{\draw[csGreen,line width=1.05pt,line cap=round,
+  line join=round] (0,1.1mm) -- (0.95mm,0.15mm) -- (2.7mm,2.3mm);}}
+
+% ================================================================= cards =====
+\tcbset{
+  csbase/.style={
+    enhanced, sharp corners=downhill, arc=2pt, boxrule=0.5pt,
+    colback=white, colframe=csRule, coltitle=white,
+    left=3mm, right=3mm, top=2.2mm, bottom=2.2mm,
+    fontupper=\normalsize},
+  cscard/.style={csbase},
+  cswash/.style={csbase, colback=csWash, colframe=csWash!70!csRule},
+  csaccent/.style={csbase, borderline west={1.6pt}{0pt}{csTeal}},
+  csalert/.style={csbase, colback=csRed!3, colframe=csRed!22,
+                  borderline west={1.6pt}{0pt}{csRed}},
+  csquote/.style={csbase, colback=csWash, colframe=csWash,
+                  borderline west={1.6pt}{0pt}{csTeal},
+                  fontupper=\latolight\normalsize},
+}
+% Card with a small coloured caption tab: \begin{cstitledbox}{colour}{caption}
+\newtcolorbox{cstitledbox}[3][]{csbase, colframe=#2!35!csRule, #1,
+  title=#3, fonttitle=\latosemi\tiny,
+  attach boxed title to top left={xshift=3mm,yshift=-1.9mm},
+  boxed title style={colback=#2, sharp corners=downhill, arc=1.5pt, boxrule=0pt,
+    left=1.8mm,right=1.8mm,top=0.5mm,bottom=0.5mm}}
+
+% ================================================================== code =====
+\lstdefinestyle{cspython}{
+  language=Python,
+  basicstyle=\ttfamily\scriptsize\color{csInk},
+  keywordstyle=\color{csTeal}\bfseries,
+  stringstyle=\color{csGreen},
+  commentstyle=\color{csMuted}\itshape,
+  showstringspaces=false,
+  columns=fullflexible,
+  keepspaces=true,
+  breaklines=false,
+  aboveskip=0pt, belowskip=0pt,
+  emph={SX,MX,DM,sym,jacobian,cse,mtimes,Opti,shape,Function},
+  emphstyle=\color{csTeal}\bfseries,
+}
+\lstdefinestyle{cscpp}{style=cspython, language=C++,
+  keywordstyle=\color{csDeep}\bfseries,
+  emph={Index,Number,TNLP,IpoptUserClass}, emphstyle=\color{csTeal}}
+\lstset{style=cspython}
+
+\newtcblisting{cscode}[2][]{%
+  csbase, colback=csWash, colframe=csWash!55!csRule,
+  borderline west={1.6pt}{0pt}{csTeal},
+  listing only, listing options={style=cspython,#1},
+  left=3mm,right=2mm,top=1.9mm,bottom=1.9mm,
+  title=#2, fonttitle=\latosemi\tiny\color{csMuted},
+  attach boxed title to top left={xshift=3mm,yshift*=-1mm},
+  boxed title style={colback=csWash,boxrule=0pt,sharp corners,left=1mm,right=1mm}}
+
+% Untitled code card, for the many slides whose snippet needs no caption.
+\newtcblisting{cscodep}[1][]{%
+  csbase, colback=csWash, colframe=csWash!55!csRule,
+  borderline west={1.6pt}{0pt}{csTeal},
+  listing only, listing options={style=cspython,#1},
+  left=3mm,right=2mm,top=1.9mm,bottom=1.9mm}
+
+% ------------------------------------------------------------ terminal ------
+% What the program printed.  Dark ground + a drawn chevron in the gutter; no
+% grey anywhere, so "grey" keeps its single meaning of "de-emphasised".
+% Program output is NOT source: reset every highlight the global \lstset would
+% otherwise inherit, or words like "is", "in", "total" in a solver log come out
+% keyword-coloured.
+\lstdefinestyle{csoutput}{
+  language={}, keywordstyle={}, emph={}, emphstyle={},
+  stringstyle=\color{csTermFg}, commentstyle=\color{csTermFg},
+  basicstyle=\ttfamily\scriptsize\color{csTermFg},
+  showstringspaces=false, columns=fullflexible, keepspaces=true,
+  breaklines=false, aboveskip=0pt, belowskip=0pt}
+% The dark ground IS the cue -- no prompt glyph.  A teal spine on the left
+% matches the code card's, so an input card and its output card read as a pair
+% (light = what you wrote, dark = what came back).
+\tcbset{csterminal/.style={%
+  enhanced, sharp corners=downhill, arc=2pt, boxrule=0pt,
+  colback=csTermBg, colframe=csTermBg,
+  borderline west={1.6pt}{0pt}{csTermAc},
+  left=3mm, right=3mm, top=1.7mm, bottom=1.7mm}}
+\newtcblisting{csterm}[1][]{csterminal,
+  listing only, listing options={style=csoutput}, #1}
+% Non-verbatim variant.  Needed when the output starts with "{": the listing
+% environment's argument scanner swallows a leading brace group and then runs
+% away looking for \end.  Escape the braces and use this instead.
+\newtcolorbox{cstermbox}[1][]{csterminal,
+  fontupper=\ttfamily\scriptsize\color{csTermFg}, #1}
+
+% A thought balloon: rounder, unbordered on the left, so it cannot be mistaken
+% for one of the code cards.  Its tail is drawn separately with \csballoontail.
+\newtcblisting{csballoon}[1][]{%
+  enhanced, arc=7pt, boxrule=0.5pt, colback=white, colframe=csRule,
+  listing only, listing options={style=cspython,#1},
+  left=4mm,right=3mm,top=2.8mm,bottom=2.8mm}
+% \csballoontail{x}{y}{dx}{dy} -- three shrinking bubbles from (x,y) outwards
+\newcommand{\csballoontail}[4]{%
+  \foreach \k/\r in {0/1.9, 1/1.35, 2/0.9}
+    {\draw[csRule,line width=0.5pt,fill=white]
+      ({#1+\k*#3},{#2+\k*#4}) circle (\r mm);}}
+
+% A shell command the audience is meant to type: mono, but clearly an input.
+\newcommand{\cscmd}[1]{%
+  \tikz[baseline=(n.base)]{\node[draw=csRule,fill=white,line width=0.5pt,
+    rounded corners=2pt,inner xsep=3.2mm,inner ysep=1.8mm,
+    font=\ttfamily\small,text=csDeep] (n) {#1};}}
+
+% The one-line conclusion a slide builds to.
+\newtcolorbox{cstake}[1][]{%
+  enhanced, sharp corners=downhill, arc=2pt, boxrule=0pt,
+  colback=csTeal!8, colframe=csTeal!8,
+  borderline west={1.8pt}{0pt}{csTeal},
+  left=3.2mm,right=3mm,top=1.8mm,bottom=1.8mm,
+  fontupper=\latosemi\normalsize\color{csDeep}, #1}
+
+% ================================================================ layout =====
+% Absolute placement in page millimetres.  Overlays built from these boxes
+% cannot move each other: every block owns a fixed rectangle, so a click can
+% only ever add ink.  \begin{onlyenv}<n-> ... \end{onlyenv} (not \only{...})
+% wraps them, because verbatim code cannot survive being read as an argument.
+\setlength{\TPHorizModule}{1mm}\setlength{\TPVertModule}{1mm}
+\textblockorigin{0mm}{0mm}
+\newenvironment{csbox}[3]% {width}{x}{y}
+  {\begin{textblock*}{#1}(#2,#3)}{\end{textblock*}}
+% Vector drawing in the same page millimetres (origin top-left, y downwards).
+\newcommand{\cscanvas}[1]{%
+  \begin{tikzpicture}[remember picture,overlay]%
+    \begin{scope}[shift={(current page.north west)},x=1mm,y=-1mm]#1\end{scope}%
+  \end{tikzpicture}}
+
+% =============================================================== diagrams ====
+\tikzset{
+  csnode/.style={draw=csRule, fill=white, rounded corners=2pt, line width=0.5pt,
+    inner sep=2.1mm, align=center, font=\small, text=csInk},
+  csstage/.style={csnode, minimum height=8mm},
+  csghost/.style={csnode, fill=csWash, draw=csWash!70!csRule, text=csMuted},
+  cshot/.style={csnode, draw=csTeal, fill=csTeal!6, text=csDeep},
+  csflow/.style={-{Stealth[length=2.4mm,width=2mm]}, csTeal, line width=1.1pt},
+  csthin/.style={-{Stealth[length=1.9mm,width=1.6mm]}, csMuted, line width=0.6pt},
+  cslead/.style={csRule, line width=0.5pt, dash pattern=on 0.6mm off 0.9mm},
+  cslabel/.style={font=\tiny\latosemi, text=csMuted, inner sep=1.1mm},
+  % CasADi expression-graph nodes, in the deck's own red-ellipse idiom
+  csgnode/.style={ellipse, fill=csRed, text=white, font=\latosemi\scriptsize,
+    inner xsep=1.5mm, inner ysep=0.7mm, minimum width=6.6mm},
+  csgsym/.style={csgnode, fill=csDeep},
+  csgedge/.style={-{Stealth[length=1.9mm,width=1.6mm]}, csTeal, line width=0.7pt},
+  % a subgraph body: dashed, because it is a graph inside a node
+  csbody/.style={draw=csMuted, dash pattern=on 1.1mm off 0.9mm, rounded corners=2.5pt,
+    line width=0.5pt, inner sep=2mm},
+  % the tape: the one thing reverse mode has to store
+  cstape/.style={csnode, draw=csAmber, fill=csAmber!8, text=csAmber!60!black},
+  cstapeflow/.style={-{Stealth[length=2.4mm,width=2mm]}, csAmber, line width=1.1pt},
+  csback/.style={-{Stealth[length=2.4mm,width=2mm]}, csRed, line width=1.1pt},
+  csport/.style={font=\tiny, text=csMuted, inner sep=0.5mm},
+  csportt/.style={font=\tiny, text=csTeal, inner sep=0.5mm},
+}
+
+% =========================================================== title slide =====
+\def\cslogoTL{}\def\cslogoTLb{}
+\def\cslogoTR{}\def\cslogoBR{}
+\newcommand{\setcslogos}[4]{%
+  \def\cslogoTL{#1}\def\cslogoTLb{#2}%
+  \def\cslogoTR{#3}\def\cslogoBR{#4}}
+
+\newcommand{\csmaketitle}{%
+\begin{frame}[plain,noframenumbering]
+\begin{tikzpicture}[remember picture,overlay]
+\begin{scope}[shift={(current page.north west)},x=1mm,y=-1mm]
+  \fill[csDark] (0,0) rectangle (160,90);
+  % soft diagonal wash + node-graph motif, echoing the CasADi logo
+  \begin{scope}
+    \clip (0,0) rectangle (160,64);
+    \fill[csTeal,opacity=0.09] (152,-12) -- (180,-12) -- (122,72) -- (94,72) -- cycle;
+    \begin{scope}[shift={(120,30)},x=0.62mm,y=0.62mm]
+      \draw[white,opacity=0.13,line width=0.4pt]
+        (0,0)--(13,7)--(25,-2) (13,7)--(10,20)--(-4,15)
+        (10,20)--(22,27) (25,-2)--(29,12)--(22,27) (29,12)--(10,20) (0,0)--(-4,15);
+      \foreach \p in {(0,0),(13,7),(25,-2),(10,20),(-4,15),(22,27),(29,12)}
+        \fill[white,opacity=0.20] \p circle (0.55mm);
+    \end{scope}
+  \end{scope}
+  \fill[white] (0,64) rectangle (160,90);
+  \fill[csTeal] (0,63.4) rectangle (160,64.6);
+  % logos
+  \ifx\cslogoTL\empty\else\node[anchor=north west,inner sep=0pt] at (11,9)  {\includegraphics[height=7mm]{\cslogoTL}};\fi
+  \ifx\cslogoTLb\empty\else\node[anchor=north west,inner sep=0pt] at (11,18.6){\includegraphics[height=2mm]{\cslogoTLb}};\fi
+  \ifx\cslogoTR\empty\else\node[anchor=north east,inner sep=0pt] at (149,7.5){\includegraphics[height=12.5mm]{\cslogoTR}};\fi
+  \ifx\cslogoBR\empty\else\node[anchor=south east,inner sep=0pt] at (149,86.5){\includegraphics[height=7mm]{\cslogoBR}};\fi
+  % title block -- explicit positions so the rhythm is exact
+  \node[anchor=north west,text width=118mm,align=left,inner sep=0pt] at (11,24) {%
+    \color{white}\latolight\usebeamerfont{title}\inserttitle};
+  \fill[csTeal] (11,45) rectangle (28,46.2);
+  \node[anchor=north west,text width=118mm,align=left,inner sep=0pt] at (11,50) {%
+    \latolight\usebeamerfont{subtitle}\color{white!58!csTeal}\insertsubtitle};
+  \node[anchor=north west,inner sep=0pt] at (11,56.4) {\cstitlechips};
+  % authors on the light band
+  \node[anchor=north west,text width=134mm,align=left,inner sep=0pt] at (11,70.5) {%
+    \color{csDeep}\usebeamerfont{author}\raggedright
+    \hyphenpenalty=10000\exhyphenpenalty=10000\insertauthor\par};
+  \node[anchor=north west,text width=134mm,align=left,inner sep=0pt] at (11,79.5) {%
+    \latolight\usebeamerfont{date}\color{csMuted}\insertdate};
+\end{scope}
+\end{tikzpicture}
+\end{frame}}
+
+\endinput

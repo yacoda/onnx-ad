@@ -1,0 +1,246 @@
+\documentclass[aspectratio=169,10pt]{beamer}
+\usepackage{cstheme}
+\input{figures}
+
+\title{Differentiating control flow}
+\subtitle{A strategy for \texttt{If}, \texttt{Scan} and \texttt{Loop}}
+\author{onnx-ad}
+\date{22 September 2026}
+\setcstitlechips{\cstitlechip{onnx-ad 0.1.0}\;\cstitlechip{design brief}}
+\setcsfootlabel{onnx-ad \textemdash{} differentiating control flow}
+
+\begin{document}
+\csmaketitle
+
+% ========================================================== 1. vocabulary ==
+\begin{frame}{One graph, three readings}
+\cscanvas{%
+  \node[cslabel,anchor=west,inner sep=0pt] at (9,34) {\textsc{primal}};
+  \node[cslabel,anchor=west,inner sep=0pt] at (9,52) {\textsc{forward adds}};
+  \node[cslabel,anchor=west,inner sep=0pt] at (9,64) {\textsc{reverse adds}};
+
+  % --- primal band, the grid every other band aligns to
+  \node[csghost,anchor=north west,minimum width=22mm] (pm) at (41,30) {MatMul};
+  \node[csghost,anchor=north west,minimum width=22mm] (pt) at (77,30) {Tanh};
+  \draw[csthin] (33,34) -- (pm.west);  \node[cslabel,anchor=south east] at (33,34.8) {$x$};
+  \draw[csthin] (pm.east) -- (pt.west); \node[cslabel,anchor=south] at (70,34.8) {$h$};
+  \draw[csthin] (pt.east) -- (111,34);  \node[cslabel,anchor=south west] at (111,34.8) {$y$};
+
+  % --- forward band
+  \node[cshot,anchor=north west,minimum width=22mm] (fm) at (41,48) {MatMul};
+  \node[cshot,anchor=north west,minimum width=22mm] (ft) at (77,48) {$\times(1-y^{2})$};
+  \draw[csflow] (33,52) -- (fm.west);
+  \node[cslabel,anchor=south east] at (33,52.8) {\texttt{fwd\_x}};
+  \draw[csflow] (fm.east) -- (ft.west);
+  \draw[csflow] (ft.east) -- (111,52);
+  \node[cslabel,anchor=south west] at (111,52.8) {\texttt{fwd\_y}};
+  \draw[cslead] (pt.south) -- (ft.north);
+
+  % --- reverse band, read right to left
+  \node[cshot,anchor=north west,minimum width=22mm,draw=csRed,fill=csRed!5,text=csRed!60!black]
+       (rm) at (41,60) {$\cdot\,W^{\!\top}$};
+  \node[cshot,anchor=north west,minimum width=22mm,draw=csRed,fill=csRed!5,text=csRed!60!black]
+       (rt) at (77,60) {$\times(1-y^{2})$};
+  \draw[csback] (111,64) -- (rt.east);
+  \node[cslabel,anchor=south west] at (111,64.8) {\texttt{adj\_y}};
+  \draw[csback] (rt.west) -- (rm.east);
+  \draw[csback] (rm.west) -- (33,64);
+  \node[cslabel,anchor=south east] at (33,64.8) {\texttt{adj\_x}};
+  \draw[cslead] (pt.south) .. controls (99,50) and (99,54) .. (rt.north);
+}
+\begin{csbox}{140mm}{9mm}{70mm}
+\muted{\footnotesize A pass \emph{adds} a band and keeps the primal, so a nonlinear rule
+reads the tensor the primal already produced \textemdash{} the dashed links. Everything
+after this slide is the same picture with a subgraph inside a node.}
+\end{csbox}
+\end{frame}
+
+% ============================================================== 2. order ===
+\begin{frame}{Why \texttt{If}, then \texttt{Scan}, then \texttt{Loop}}
+\cscanvas{%
+  \node[cslabel,anchor=west,inner sep=0pt] at (44,27) {\textsc{new capability needed}};
+  \node[cslabel,anchor=west,inner sep=0pt] at (100,27) {\textsc{reverse mode needs}};
+  \foreach \n/\y/\a/\b in {%
+    \texttt{If}/30/{recursion into subgraphs,\\outer-scope capture}/{nothing iterative},
+    \texttt{Scan}/43/{a tape, and a sweep in\\the opposite direction}/{a trip count known
+      \textbf{before}\\the primal runs},
+    \texttt{Loop}/56/{a trip count known only\\\textbf{after} the primal runs}/{the \texttt{Scan}
+      machinery,\\fed by that trip count}}{%
+    \node[cshot,anchor=north west,minimum width=24mm,minimum height=9mm] at (9,\y) {\n};
+    \node[anchor=north west,text width=52mm,align=left,inner sep=0pt,
+          font=\footnotesize,text=csInk] at (44,\y+1.2) {\a};
+    \node[anchor=north west,text width=50mm,align=left,inner sep=0pt,
+          font=\footnotesize,text=csInk] at (100,\y+1.2) {\b};
+    \draw[cslead] (9,\y+11.5) -- (151,\y+11.5);}
+}
+\begin{csbox}{140mm}{9mm}{71mm}
+\begin{cstake}
+The adjoint of a \texttt{Loop} is a \texttt{Scan}: once the primal loop has run, its trip
+count is data.
+\end{cstake}
+\end{csbox}
+\end{frame}
+
+% ================================================================= 3. If ===
+\begin{frame}{\texttt{If} \textemdash{} differentiate inside the branch}
+\cscanvas{%
+  \foreach \x/\lbl in {9/{\textsc{primal}}, 57/{\textsc{forward}}, 105/{\textsc{reverse}}}
+    {\node[cslabel,anchor=west,inner sep=0pt] at (\x,27) {\lbl};}
+
+  % ---- primal
+  \cfnode{9}{30}{38}{32}{If}{csghost}
+  \bodybox{13}{39}{30}{9}{then}
+  \bodybox{13}{50}{30}{9}{else}
+  \node[csport,anchor=west,inner sep=0pt] at (13,35.8) {\texttt{cond}};
+  \draw[csthin] (47,44) -- (53,44); \node[csport,anchor=east,inner sep=0pt] at (53,41.8) {$y$};
+
+  % ---- forward
+  \cfnode{57}{30}{38}{32}{If}{cshot}
+  \bodybox{61}{39}{30}{9}{then $+$ tangent}
+  \bodybox{61}{50}{30}{9}{else $+$ tangent}
+  \node[csport,anchor=west,inner sep=0pt] at (61,35.8) {\texttt{cond}};
+  \draw[csthin] (95,44) -- (101,44); \node[csport,anchor=east,inner sep=0pt] at (101,41.8) {$y$};
+  \draw[csflow] (95,54) -- (101,54);
+  \node[csportt,anchor=east,inner sep=0pt] at (101,51.8) {\texttt{fwd\_y}};
+
+  % ---- reverse
+  \cfnode{105}{30}{38}{32}{If}{cshot}
+  \bodybox{109}{39}{30}{9}{then adjoint}
+  \bodybox{109}{50}{30}{9}{else adjoint}
+  \draw[csback] (151,44) -- (143,44);
+  \node[csport,anchor=east,inner sep=0pt] at (151,41.8) {\texttt{adj\_y}};
+  \draw[csback] (143,54) -- (151,54);
+  \node[csport,anchor=east,inner sep=0pt] at (151,51.8) {\texttt{adj\_}$w$};
+
+  \foreach \x/\t in {9/{branches have no inputs:\\everything is captured},
+                     57/{each branch output grows\\by its own tangent},
+                     105/{one output per \emph{captured}\\outer value}}
+    {\node[cslabel,anchor=north west,text width=42mm,inner sep=0pt] at (\x,64) {\t};}
+}
+\begin{csbox}{140mm}{9mm}{70mm}
+\begin{cstake}
+Only the taken branch computes its derivative \textemdash{} which is why not to evaluate both
+and select with \texttt{Where}.
+\end{cstake}
+\end{csbox}
+\end{frame}
+
+% ====================================================== 4. Scan, forward ===
+\begin{frame}{\texttt{Scan} forward \textemdash{} one \texttt{Scan}, no tape}
+\cscanvas{%
+  \node[cslabel,anchor=west,inner sep=0pt] at (9,27) {\textsc{primal}};
+  \cfnode{9}{31}{60}{22}{Scan}{csghost}
+  \bodybox{25}{37}{28}{12}{body}
+  \ports{23.5}{41}{5}{csport}{$s$,$x$}
+  \portsr{54.5}{41}{5}{csport}{$s'$,$y$}
+  \node[cslabel,anchor=north west,inner sep=0pt] at (9,55) {\texttt{num\_scan\_inputs} $=M$};
+
+  \node[cslabel,anchor=west,inner sep=0pt] at (83,27) {\textsc{forward}};
+  \cfnode{83}{31}{60}{34}{Scan}{cshot}
+  \bodybox{99}{37}{28}{24}{body}
+  \ports{97.5}{41}{5}{csport}{$s$,$x$}
+  \ports{97.5}{51}{5}{csportt}{\texttt{t\_}$s$,\texttt{t\_}$x$}
+  \portsr{128.5}{41}{5}{csport}{$s'$,$y$}
+  \portsr{128.5}{51}{5}{csportt}{\texttt{t\_}$s'$,\texttt{t\_}$y$}
+  \node[cslabel,anchor=north west,inner sep=0pt] at (83,67) {\texttt{num\_scan\_inputs} $=2M$};
+  \draw[csflow] (71,45) -- (80,45);
+}
+\begin{csbox}{140mm}{9mm}{71mm}
+\begin{cstake}
+The tangent of a scan is a scan of the same length whose state is the pair $(s,\ \dot s)$:
+two\texttimes{} the body, any number of seeds, nothing stored.
+\end{cstake}
+\end{csbox}
+\end{frame}
+
+% ====================================================== 5. Scan, reverse ===
+\begin{frame}{\texttt{Scan} reverse \textemdash{} tape the state, sweep backwards}
+\cscanvas{%
+  \cfnode{9}{29}{62}{26}{Scan \textemdash{} primal $+$ tape}{csghost}
+  \bodybox{26}{37}{28}{14}{body}
+  \ports{24.5}{42}{5}{csport}{$s$,$x$}
+  \portsr{55.5}{42}{5}{csport}{$s'$,$y$}
+  \node[cstape,anchor=north,minimum width=32mm] (tp) at (40,59) {tape: $s$ per iteration};
+  \draw[cstapeflow] (40,55) -- (40,59);
+
+  \cfnode{85}{29}{62}{30}{Scan \textemdash{} reversed}{cshot}
+  \bodybox{104}{37}{30}{18}{recompute,\\then adjoint}
+  \ports{102.5}{42}{5}{csport}{$\leftarrow$\,tape,$\leftarrow x$,$\leftarrow$\,\texttt{adj\_}$y$}
+  \portsr{135.5}{42}{5}{csport}{\texttt{adj\_}$s$,\texttt{adj\_}$x$,\texttt{acc\_}$w$}
+  \draw[cstapeflow] (tp.east) .. controls (72,63) and (78,50) .. (85,46);
+  \node[cslabel,anchor=north west,inner sep=0pt] at (85,61)
+    {\texttt{direction\,=\,1} on every scan input and output};
+}
+\begin{csbox}{140mm}{9mm}{69mm}
+\begin{cstake}
+The taped input state is the minimal recomputation root \textemdash{} and a captured weight
+accumulates in the \emph{state}, so its adjoint costs $O(|w|)$, not $O(T\!\cdot\!|w|)$.
+\end{cstake}
+\end{csbox}
+\end{frame}
+
+% ============================================================== 6. Loop ====
+\begin{frame}{\texttt{Loop} reverse \textemdash{} the trip count becomes data}
+\cscanvas{%
+  \cfnode{9}{29}{44}{22}{Loop \textemdash{} primal $+$ tape}{csghost}
+  \bodybox{20}{37}{26}{11}{body}
+  \node[cstape,anchor=north,minimum width=24mm] (tp) at (31,56) {tape};
+  \draw[cstapeflow] (31,51) -- (31,56);
+  \node[cshot,anchor=north west,minimum width=34mm] (sh) at (62,56)
+       {\texttt{Shape(tape)[0]}\,$=T$};
+  \draw[cstapeflow] (tp.east) -- (sh.west);
+
+  \cfnode{62}{27}{84}{24}{If\ \ $T>0$}{cshot}
+  \bodybox{70}{34}{70}{10}{then: the reversed \texttt{Scan} from the previous slide}
+  \node[cslabel,anchor=north west,text width=70mm,inner sep=0pt] at (70,46)
+    {else: the zero-initialised accumulators};
+  \draw[csflow] (sh.north) -- (79,51);
+}
+\begin{csbox}{140mm}{9mm}{63mm}
+\muted{\footnotesize A reversed \texttt{Loop} tolerates $T=0$ natively, but needs
+\texttt{Gather(tape,\,T-1-i)} \emph{and} a final flip of its scan outputs.}
+\end{csbox}
+\begin{csbox}{140mm}{9mm}{71mm}
+\begin{cstake}
+The reverse sweep is a \texttt{Scan}, not a \texttt{Loop}: reading backwards removes all index
+arithmetic.
+\end{cstake}
+\end{csbox}
+\end{frame}
+
+% ======================================================= 7. checked + plan =
+\begin{frame}{Checked against the runtime, and the order of work}
+\cscanvas{%
+  \node[cslabel,anchor=west,inner sep=0pt] at (9,26) {\textsc{ONNX Runtime 1.30 \textemdash{} measured, not assumed}};
+  \foreach \m/\y/\t in {%
+    \cscheck/33/{outer-scope capture, two levels deep},
+    \cscheck/40/{reversed scan input \emph{and} output directions},
+    \cscheck/47/{a scan state carrying a trailing seed axis},
+    \cscheck/54/{loop trip count from \texttt{Shape(tape)[0]}},
+    \csx/61/{\textbf{a zero-length \texttt{Scan} is rejected}},
+    \cscheck/68/{an \texttt{If} guarding that empty case}}{%
+    \node[anchor=west,inner sep=0pt] at (9,\y) {\m};
+    \node[anchor=west,inner sep=0pt,font=\footnotesize,text=csInk,text width=56mm]
+         at (14,\y) {\t};}
+
+  \node[cslabel,anchor=west,inner sep=0pt] at (84,26) {\textsc{staging}};
+  \foreach \n/\y/\t in {%
+    0/34/{\texttt{unroll} for a static trip count \textemdash{} small, useful
+          alone, and the test oracle},
+    1/46/{scope chain, shared name allocator, capture analysis; then \texttt{If}},
+    2/58/{\texttt{Scan} forward, then \texttt{Scan} reverse},
+    3/68/{\texttt{Loop}, on top of \texttt{Scan}'s}}{%
+    \node[cshot,anchor=north west,minimum width=7mm,minimum height=7mm,
+          font=\latosemi\footnotesize] at (84,\y-3) {\n};
+    \node[anchor=north west,inner sep=0pt,font=\footnotesize,text=csInk,text width=52mm]
+         at (95,\y-3) {\t};}
+}
+\begin{csbox}{140mm}{9mm}{73mm}
+\begin{cstake}
+Unrolling is the oracle: two Jacobians from two independent implementations, needing no
+framework to referee them.
+\end{cstake}
+\end{csbox}
+\end{frame}
+
+\end{document}

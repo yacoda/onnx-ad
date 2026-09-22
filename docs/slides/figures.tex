@@ -1,0 +1,29 @@
+% ===========================================================================
+% Repeated figures as macros: the same picture is literally the same drawing
+% wherever it appears, and cannot drift. Page millimetres, origin top-left.
+% ===========================================================================
+\newcommand{\csx}{\tikz[baseline]{\draw[csRed,line width=1.05pt,line cap=round]
+  (0,0.2mm)--(2.4mm,2.4mm) (0,2.4mm)--(2.4mm,0.2mm);}}
+
+% A subgraph body drawn as a dashed box.  \bodybox{x}{y}{w}{h}{label}
+\newcommand{\bodybox}[5]{%
+  \node[csbody,anchor=north west,minimum width=#3 mm,minimum height=#4 mm,fill=white]
+       at (#1,#2) {};
+  \node[cslabel,anchor=north west,inner sep=0pt,align=left] at (#1+1.6,#2+1.2) {#5};}
+
+% A row of port labels down the left or right edge of a body box.
+% \ports{x}{y0}{dy}{style}{a/b/c}
+\newcommand{\ports}[5]{%
+  \foreach \p [count=\i from 0] in {#5}
+    {\node[#4,anchor=east,inner sep=0pt] at (#1,{#2+\i*#3}) {\p};}}
+\newcommand{\portsr}[5]{%
+  \foreach \p [count=\i from 0] in {#5}
+    {\node[#4,anchor=west,inner sep=0pt] at (#1,{#2+\i*#3}) {\p};}}
+
+% A Scan/Loop/If node drawn large enough to hold a body.
+% \cfnode{x}{y}{w}{h}{title}{style}
+\newcommand{\cfnode}[6]{%
+  \node[#6,anchor=north west,minimum width=#3 mm,minimum height=#4 mm,align=left]
+       at (#1,#2) {};
+  \node[anchor=north west,inner sep=0pt,font=\latosemi\footnotesize,text=csDeep]
+       at (#1+2.4,#2+2.2) {#5};}
