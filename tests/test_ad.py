@@ -24,6 +24,14 @@ from onnx_ad import UnsupportedOperator, forward, reverse
 RNG = np.random.default_rng(7)
 
 
+#: An ONNX model carries two independent version numbers, and both have a ceiling here:
+#: the IR version must not exceed what the installed `onnx` checker knows, nor what the
+#: installed ONNX Runtime will load (10, for every release up to 1.22). The opset version
+#: must not exceed what the installed `onnx` has operator definitions for.
+IR_VERSION = min(onnx.IR_VERSION, 10)
+MAX_OPSET = onnx.defs.onnx_opset_version()
+
+
 def build(nodes, inputs, outputs, initializers=(), opset=18, dtype=TensorProto.DOUBLE):
     graph = helper.make_graph(
         nodes, "g",
@@ -31,7 +39,7 @@ def build(nodes, inputs, outputs, initializers=(), opset=18, dtype=TensorProto.D
         [helper.make_tensor_value_info(n, dtype, s) for n, s in outputs],
         list(initializers))
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset)])
-    model.ir_version = 10  # the highest ONNX Runtime 1.16-1.22 will load
+    model.ir_version = IR_VERSION
     onnx.checker.check_model(model)
     return model
 
@@ -227,20 +235,32 @@ class ElementwiseTests(JacobianCase):
             if op in self.SINGLE:
                 continue
             with self.subTest(op=op):
-                model = build([helper.make_node(op, ["x"], ["y"])], [("x", [4])], [("y", [4])])
+                node = helper.make_node(op, ["x"], ["y"])
+                model = build([node], [("x", [4])], [("y", [4])])
                 x = self.argument(op)
-                self.check(model, {"x": x}, np.diag(derivative(x)))
+                if available(model, {"x": x}):
+                    self.check(model, {"x": x}, np.diag(derivative(x)))
+                    continue
+                # older runtimes lack a double kernel for some activations; drop to float32
+                # and to the analytic derivative alone, since differences are then useless
+                model = build([node], [("x", [4])], [("y", [4])], dtype=TensorProto.FLOAT)
+                x = self.argument(op, np.float32)
+                self.check(model, {"x": x}, np.diag(derivative(x)), rtol=3e-6,
+                           differences=False)
 
     def test_rules_without_a_double_kernel(self):
         for op in sorted(self.SINGLE):
             with self.subTest(op=op):
+                opset = self.OPSET.get(op, 18)
+                if opset > MAX_OPSET:
+                    continue  # this onnx has no definition for the operation yet
                 model = build([helper.make_node(op, ["x"], ["y"])], [("x", [4])],
-                              [("y", [4])], opset=self.OPSET.get(op, 18),
-                              dtype=TensorProto.FLOAT)
+                              [("y", [4])], opset=opset, dtype=TensorProto.FLOAT)
                 x = self.argument(op, np.float32)
                 self.check(model, {"x": x}, np.diag(self.CASES[op](x)), rtol=3e-6,
                            differences=False)
 
+    @unittest.skipIf(MAX_OPSET < 20, "Gelu arrived in opset 20")
     def test_gelu_tanh_approximation(self):
         model = build([helper.make_node("Gelu", ["x"], ["y"], approximate="tanh")],
                       [("x", [4])], [("y", [4])], opset=20, dtype=TensorProto.FLOAT)
@@ -984,7 +1004,7 @@ class SymbolicShapeTests(JacobianCase):
             [helper.make_tensor_value_info("y", TensorProto.DOUBLE, ["batch", 3])],
             [numpy_helper.from_array(w, "w"), numpy_helper.from_array(b, "b")])
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
-        model.ir_version = 10
+        model.ir_version = IR_VERSION
         onnx.checker.check_model(model)
         x = RNG.standard_normal((2, 4))
         seeds = pack(np.eye(8).reshape(2, 4, 8), (2, 4))
@@ -1003,7 +1023,7 @@ class SymbolicShapeTests(JacobianCase):
              helper.make_tensor_value_info("a", TensorProto.DOUBLE, ["batch", 3])],
             [helper.make_tensor_value_info("y", TensorProto.DOUBLE, ["batch", 3])])
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
-        model.ir_version = 10
+        model.ir_version = IR_VERSION
         onnx.checker.check_model(model)
         x, a = RNG.standard_normal((1, 3)), RNG.standard_normal((4, 3))
         seeds = pack(np.eye(12).reshape(4, 3, 12), (4, 3))
@@ -1127,7 +1147,7 @@ class SelectionTests(JacobianCase):
              helper.make_tensor_value_info("z", TensorProto.DOUBLE, [3])],
             [numpy_helper.from_array(np.ones(3), "c")])
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
-        model.ir_version = 10
+        model.ir_version = IR_VERSION
         out = run(forward(model), {"x": np.zeros(2), "fwd_x": np.ones((2, 4))})
         np.testing.assert_allclose(out["fwd_z"], np.zeros((3, 4)))
         self.assertEqual(out["fwd_z"].shape, (3, 4))  # rank-1 values need no repacking
@@ -1167,7 +1187,7 @@ class SelectionTests(JacobianCase):
             [numpy_helper.from_array(np.arange(3.0), "c"),
              numpy_helper.from_array(np.array([1.0], dtype=np.float32), "r")])
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
-        model.ir_version = 10
+        model.ir_version = IR_VERSION
         derivative = forward(model, outputs=["y"])
         self.assertIn("fwd_y", [v.name for v in derivative.graph.output])
 
