@@ -2187,3 +2187,155 @@ def _instance_norm_reverse(ctx, node, grads):
     return [ctx.b.op("Mul", [ctx.lift(invstd), ctx.b.op("Sub", [centered, projection])]),
             per_channel(ctx.b.op("Mul", [seeded, ctx.lift(standardized)])),
             per_channel(seeded)]
+
+
+# --- windowed pooling ------------------------------------------------------------------------
+# MaxPool picks one element per window: it can report which (its Indices output, flattened
+# over the whole input), so its tangent is a Gather and its adjoint a scatter-add there.
+# AveragePool and LpPool are sums over windows, i.e. grouped convolutions with a kernel of
+# ones, and their adjoints are the matching ConvTranspose. The seed axis folds into the
+# batch, as for Conv.
+
+def _pool_attributes(ctx, node, reverse):
+    auto_pad = attribute(node, "auto_pad", "NOTSET")
+    if auto_pad not in ("NOTSET", "VALID"):
+        raise UnsupportedOperator(
+            "%s with auto_pad=%s is not differentiated; re-export with explicit pads"
+            % (node.op_type, auto_pad))
+    if reverse and attribute(node, "ceil_mode", 0):
+        raise UnsupportedOperator(
+            "%s with ceil_mode=1 is not differentiated in reverse mode: a window can then "
+            "overhang the input, which no convolution reproduces" % node.op_type)
+    kernel = list(attribute(node, "kernel_shape"))
+    spatial = len(kernel)
+    return {"kernel_shape": kernel,
+            "strides": list(attribute(node, "strides", [1]*spatial)),
+            "pads": list(attribute(node, "pads", [0]*(2*spatial))),
+            "dilations": list(attribute(node, "dilations", [1]*spatial))}, spatial
+
+
+def _ones_kernel(ctx, node, attrs):
+    """[C, 1, k...] of ones: a per-channel window sum as a grouped convolution."""
+    shape = ctx.shapes.static(node.input[0])
+    if shape is None:
+        raise UnsupportedOperator("%s needs a declared input shape to be differentiated"
+                                  % node.op_type)
+    kernel = [shape[1], 1] + attrs["kernel_shape"]
+    return ctx.b.constant(np.ones(kernel), ctx.dtype(node.input[0]), kernel), shape[1]
+
+
+def _window_sum(ctx, node, attrs, value, reference):
+    """Sum a seeded tensor shaped like `reference` over every pooling window."""
+    ones, channels = _ones_kernel(ctx, node, attrs)
+    folded = _fold_seed_into_batch(ctx, value, reference)
+    summed = ctx.b.op("Conv", [folded, ones], group=channels, stem="window_sum", **attrs)
+    return _unfold_batch_into_seed(ctx, summed, node.output[0], ctx.rank(node.output[0]))
+
+
+def _window_spread(ctx, node, attrs, value):
+    """The adjoint of `_window_sum`: spread each window's value back over the window."""
+    ones, channels = _ones_kernel(ctx, node, attrs)
+    x, y = node.input[0], node.output[0]
+    transposed = dict(attrs, output_shape=list(ctx.shapes.static(x)[2:]))
+    transposed.pop("kernel_shape")
+    folded = _fold_seed_into_batch(ctx, value, y)
+    spread = ctx.b.op("ConvTranspose", [folded, ones], group=channels, stem="window_spread",
+                      **transposed)
+    return _unfold_batch_into_seed(ctx, spread, x, ctx.rank(x))
+
+
+def _max_pool_indices(ctx, node):
+    """Where each window's maximum came from, flattened over the whole input."""
+    if len(node.output) > 1 and node.output[1] and attribute(node, "storage_order", 0) == 0:
+        return node.output[1]
+    extra = {a.name: helper.get_attribute_value(a) for a in node.attribute
+             if a.name != "storage_order"}
+    _, indices = ctx.b.op("MaxPool", [node.input[0]], outputs=2, stem="argmax", **extra)
+    return indices
+
+
+@forward_rule("MaxPool")
+def _max_pool_forward(ctx, node, tangents):
+    _pool_attributes(ctx, node, reverse=False)
+    x = node.input[0]
+    flat = ctx.b.op("Reshape", [ctx.full(tangents[0], x),
+                                ctx.b.op("Concat", [ctx.b.ints([-1]), ctx.count()], axis=0)],
+                    stem="flat")
+    return [ctx.b.op("Gather", [flat, _max_pool_indices(ctx, node)], axis=0,
+                     stem="t_maxpool")] + [None]*(len(node.output) - 1)
+
+
+@reverse_rule("MaxPool")
+def _max_pool_reverse(ctx, node, grads):
+    if ctx.opset < 16:
+        raise UnsupportedOperator("MaxPool needs ScatterND with reduction='add' (opset 16) "
+                                  "to be differentiated in reverse")
+    _pool_attributes(ctx, node, reverse=False)  # overlapping windows just accumulate
+    x = node.input[0]
+    size = ctx.b.op("Reshape", [ctx.b.op("Size", [x]), ctx.b.ints([1])], stem="numel")
+    zeros = ctx.b.op("ConstantOfShape", [ctx.b.op("Concat", [size, ctx.count()], axis=0)],
+                     value=helper.make_tensor("zero", ctx.dtype(x), [1], [0]), stem="zeros")
+    indices = ctx.unsqueeze(_max_pool_indices(ctx, node), [-1])
+    scattered = ctx.b.op("ScatterND", [zeros, indices, ctx.full(grads[0], node.output[0])],
+                         reduction="add", stem="a_maxpool")
+    return [ctx.reshape_like(scattered, x)]
+
+
+def _average_count(ctx, node, attrs):
+    """How many elements each window averages over, shaped to divide the output."""
+    x, dtype = node.input[0], ctx.dtype(node.input[0])
+    if attribute(node, "count_include_pad", 0) or not any(attrs["pads"]):
+        return ctx.constant(float(np.prod(attrs["kernel_shape"])), dtype)
+    # padding excluded: the window sum of a tensor of ones counts the real elements
+    ones, channels = _ones_kernel(ctx, node, attrs)
+    filled = ctx.b.op("ConstantOfShape", [ctx.shape_of(x)],
+                      value=helper.make_tensor("one", dtype, [1], [1]), stem="ones")
+    return ctx.lift(ctx.b.op("Conv", [filled, ones], group=channels, stem="count", **attrs))
+
+
+@forward_rule("AveragePool")
+def _average_pool_forward(ctx, node, tangents):
+    # linear, so the tangent is the same pooling of the tangent, one image per seed
+    x, y = node.input[0], node.output[0]
+    folded = _fold_seed_into_batch(ctx, ctx.full(tangents[0], x), x)
+    pooled = ctx.b.op("AveragePool", [folded], stem="t_avgpool",
+                      **{a.name: helper.get_attribute_value(a) for a in node.attribute})
+    return _unfold_batch_into_seed(ctx, pooled, y, ctx.rank(y))
+
+
+@reverse_rule("AveragePool")
+def _average_pool_reverse(ctx, node, grads):
+    attrs, _ = _pool_attributes(ctx, node, reverse=True)
+    divided = ctx.b.op("Div", [ctx.full(grads[0], node.output[0]),
+                               _average_count(ctx, node, attrs)])
+    return [_window_spread(ctx, node, attrs, divided)]
+
+
+def _lp_pool_weights(ctx, node):
+    """sign(x)|x|^(p-1) and y^(1-p): y = (window sum of |x|^p)^(1/p), so
+    dy = y^(1-p) . window_sum(sign(x)|x|^(p-1) dx)."""
+    x, y = node.input[0], node.output[0]
+    dtype = ctx.dtype(x)
+    power = float(attribute(node, "p", 2))
+    inner = ctx.b.op("Mul", [ctx.b.op("Sign", [x]), ctx.b.op(
+        "Pow", [ctx.b.op("Abs", [x]), ctx.constant(power - 1.0, dtype)])])
+    outer = ctx.b.op("Pow", [y, ctx.constant(1.0 - power, dtype)])
+    return inner, outer
+
+
+@forward_rule("LpPool")
+def _lp_pool_forward(ctx, node, tangents):
+    attrs, _ = _pool_attributes(ctx, node, reverse=True)
+    inner, outer = _lp_pool_weights(ctx, node)
+    weighted = ctx.b.op("Mul", [ctx.lift(inner), ctx.full(tangents[0], node.input[0])])
+    return ctx.b.op("Mul", [ctx.lift(outer), _window_sum(ctx, node, attrs, weighted,
+                                                         node.input[0])], stem="t_lppool")
+
+
+@reverse_rule("LpPool")
+def _lp_pool_reverse(ctx, node, grads):
+    attrs, _ = _pool_attributes(ctx, node, reverse=True)
+    inner, outer = _lp_pool_weights(ctx, node)
+    scaled = ctx.b.op("Mul", [ctx.full(grads[0], node.output[0]), ctx.lift(outer)])
+    return [ctx.b.op("Mul", [ctx.lift(inner), _window_spread(ctx, node, attrs, scaled)],
+                     stem="a_lppool")]

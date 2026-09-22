@@ -43,7 +43,9 @@ def runs(model, feeds):
         return False
 
 
-class MoreOpTests(JacobianCase):
+class Case(JacobianCase):
+    """The shared harness; test classes derive from it rather than from each other."""
+
     def case(self, nodes, x_shape, y_shape, initializers=(), opset=18, x=None, reference=None,
              outputs=None):
         """Double where the runtime can, float32 with a coarse step where it cannot."""
@@ -68,6 +70,8 @@ class MoreOpTests(JacobianCase):
             self.skipTest("does not run in this ONNX Runtime")
         return self.check(model, {"x": x}, None, rtol=5e-5, step=1e-3, fd_tol=5e-3)
 
+
+class MoreOpTests(Case):
     def test_trilu(self):
         for upper in (0, 1):
             with self.subTest(upper=upper):
@@ -141,6 +145,52 @@ class MoreOpTests(JacobianCase):
         self.case(helper.make_node("InstanceNormalization", ["x", "s", "b"], ["y"]),
                   [2, 3, 5], [2, 3, 5], [arr("s", RNG.standard_normal(3)),
                                          arr("b", RNG.standard_normal(3))])
+
+
+class PoolingTests(Case):
+    def test_max_pool(self):
+        for strides, pads in (([2, 2], [0, 0, 0, 0]), ([1, 1], [1, 1, 1, 1])):
+            with self.subTest(strides=strides, pads=pads):
+                shape = [1, 2, 2, 2] if strides == [2, 2] else [1, 2, 4, 4]
+                self.case(helper.make_node("MaxPool", ["x"], ["y"], kernel_shape=[2, 2] if
+                                           strides == [2, 2] else [3, 3], strides=strides,
+                                           pads=pads), [1, 2, 4, 4], shape)
+
+    def test_max_pool_with_its_indices(self):
+        outputs = [helper.make_tensor_value_info("y", TensorProto.DOUBLE, [1, 2, 2, 2]),
+                   helper.make_tensor_value_info("i", TensorProto.INT64, [1, 2, 2, 2])]
+        self.case(helper.make_node("MaxPool", ["x"], ["y", "i"], kernel_shape=[2, 2],
+                                   strides=[2, 2]), [1, 2, 4, 4], [1, 2, 2, 2], outputs=outputs)
+
+    def test_average_pool(self):
+        for include, pads in ((0, [1, 1, 1, 1]), (1, [1, 1, 1, 1]), (0, [0, 0, 0, 0])):
+            with self.subTest(count_include_pad=include, pads=pads):
+                out = [1, 2, 4, 4] if any(pads) else [1, 2, 2, 2]
+                self.case(helper.make_node("AveragePool", ["x"], ["y"], kernel_shape=[3, 3]
+                                           if any(pads) else [2, 2], strides=[1, 1] if
+                                           any(pads) else [2, 2], pads=pads,
+                                           count_include_pad=include), [1, 2, 4, 4], out)
+
+    def test_average_pool_one_dimensional(self):
+        self.case(helper.make_node("AveragePool", ["x"], ["y"], kernel_shape=[3], strides=[2]),
+                  [2, 3, 7], [2, 3, 3])
+
+    def test_lp_pool(self):
+        x = RNG.standard_normal((1, 2, 4, 4)) + 0.2
+        for p in (1, 2, 3):
+            with self.subTest(p=p):
+                self.case(helper.make_node("LpPool", ["x"], ["y"], kernel_shape=[2, 2],
+                                           strides=[2, 2], p=p), [1, 2, 4, 4], [1, 2, 2, 2],
+                          x=x)
+
+    def test_a_small_cnn(self):
+        w = RNG.standard_normal((4, 2, 3, 3))
+        nodes = [helper.make_node("Conv", ["x", "w"], ["c"], pads=[1, 1, 1, 1],
+                                  kernel_shape=[3, 3]),
+                 helper.make_node("Relu", ["c"], ["r"]),
+                 helper.make_node("MaxPool", ["r"], ["p"], kernel_shape=[2, 2], strides=[2, 2]),
+                 helper.make_node("GlobalAveragePool", ["p"], ["y"])]
+        self.case(nodes, [1, 2, 4, 4], [1, 4, 1, 1], [arr("w", w)])
 
 
 if __name__ == "__main__":
