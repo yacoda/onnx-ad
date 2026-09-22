@@ -193,5 +193,42 @@ class PoolingTests(Case):
         self.case(nodes, [1, 2, 4, 4], [1, 4, 1, 1], [arr("w", w)])
 
 
+class EinsumTests(Case):
+    CASES = [
+        # equation, shape of x, shape of the other operand (None: x alone), output shape
+        ("ij,jk->ik", [2, 3], [3, 4], [2, 4]),
+        ("bij,bjk->bik", [2, 3, 4], [2, 4, 2], [2, 3, 2]),
+        ("...ij,...jk->...ik", [2, 3, 4], [2, 4, 2], [2, 3, 2]),
+        ("bhqd,bhkd->bhqk", [1, 2, 3, 4], [1, 2, 5, 4], [1, 2, 3, 5]),  # attention scores
+        ("i,j->ij", [3], [4], [3, 4]),                                   # outer product
+        ("i,i->", [3], [3], []),                                         # dot product
+        ("ij->ji", [2, 3], None, [3, 2]),                                # transpose
+        ("ij->i", [2, 3], None, [2]),                                    # summed index
+        ("ij", [2, 3], None, [2, 3]),                                    # implicit output
+        ("ij,jk", [2, 3], [3, 4], [2, 4]),                               # implicit, contracted
+    ]
+
+    def test_equations(self):
+        for equation, x_shape, other, y_shape in self.CASES:
+            with self.subTest(equation=equation):
+                inputs = ["x"] + (["w"] if other is not None else [])
+                initializers = [arr("w", RNG.standard_normal(other))] if other else []
+                self.case(helper.make_node("Einsum", inputs, ["y"], equation=equation),
+                          x_shape, y_shape, initializers, opset=12)
+
+    def test_second_operand(self):
+        self.case(helper.make_node("Einsum", ["w", "x"], ["y"], equation="ij,jk->ik"),
+                  [3, 4], [2, 4], [arr("w", RNG.standard_normal((2, 3)))], opset=12)
+
+    def test_both_operands_are_the_input(self):
+        self.case(helper.make_node("Einsum", ["x", "x"], ["y"], equation="ij,kj->ik"),
+                  [2, 3], [2, 2], opset=12)
+
+    def test_broadcast_ellipsis(self):
+        # x's ellipsis is one batch dimension of size 1 against the other operand's 2
+        self.case(helper.make_node("Einsum", ["x", "w"], ["y"], equation="...ij,...jk->...ik"),
+                  [1, 3, 4], [2, 3, 2], [arr("w", RNG.standard_normal((2, 4, 2)))], opset=12)
+
+
 if __name__ == "__main__":
     unittest.main()

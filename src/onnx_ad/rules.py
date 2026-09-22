@@ -2339,3 +2339,87 @@ def _lp_pool_reverse(ctx, node, grads):
     scaled = ctx.b.op("Mul", [ctx.full(grads[0], node.output[0]), ctx.lift(outer)])
     return [ctx.b.op("Mul", [ctx.lift(inner), _window_spread(ctx, node, attrs, scaled)],
                      stem="a_lppool")]
+
+
+# --- Einsum ----------------------------------------------------------------------------------
+# The seed axis becomes one more index letter, unused elsewhere in the equation: appended to
+# the differentiated operand and to the output, it rides along untouched -- trailing, where
+# the layout wants it. The adjoint for an operand is another Einsum, of the output's adjoint
+# with the other operands, into that operand's indices; an index that appears nowhere else
+# (it was summed away) cannot be produced by an Einsum, so it is reinserted as a broadcast
+# axis afterwards.
+
+def _einsum_parts(node):
+    """The operand specs and the explicit output spec (implicit mode made explicit)."""
+    equation = attribute(node, "equation").replace(" ", "")
+    left, _, output = equation.partition("->")
+    specs = left.split(",")
+    if "->" not in equation:  # implicit: every index that occurs once, alphabetically
+        letters = [c for spec in specs for c in spec.replace("...", "")]
+        output = ("..." if any("..." in s for s in specs) else "") + \
+            "".join(sorted(c for c in set(letters) if letters.count(c) == 1))
+    fresh = next(c for c in "zyxwvutsrqponmlkjihgfedcbaZYXWVUTSRQPONMLKJIHGFEDCBA"
+                 if c not in equation)
+    return specs, output, fresh
+
+
+def _letters(spec):
+    return spec.replace("...", "")
+
+
+@forward_rule("Einsum")
+def _einsum_forward(ctx, node, tangents):
+    specs, output, seed = _einsum_parts(node)
+    terms = []
+    for i, tangent in enumerate(tangents):
+        if tangent is None:
+            continue
+        operands = list(node.input)
+        operands[i] = ctx.full(tangent, node.input[i])
+        seeded = list(specs)
+        seeded[i] = specs[i] + seed
+        terms.append(ctx.b.op("Einsum", operands, stem="t_einsum",
+                              equation=",".join(seeded) + "->" + output + seed))
+    return ctx.sum(terms)
+
+
+@reverse_rule("Einsum")
+def _einsum_reverse(ctx, node, grads):
+    specs, output, seed = _einsum_parts(node)
+    y = node.output[0]
+    seeded = ctx.full(grads[0], y)
+    ellipsis = ctx.rank(y) - len(_letters(output)) if "..." in output else 0
+    contributions = []
+    for i, name in enumerate(node.input):
+        if not ctx.asked_for(name):
+            contributions.append(None)
+            continue
+        spec, letters = specs[i], _letters(specs[i])
+        if len(set(letters)) != len(letters):
+            raise UnsupportedOperator(
+                "Einsum with a repeated index in one operand (a diagonal, '%s') is not "
+                "differentiated in reverse" % spec)
+        if "..." in spec and not spec.startswith("..."):
+            raise UnsupportedOperator(
+                "Einsum is differentiated in reverse only with a leading ellipsis ('%s')" % spec)
+        if "..." in output and "..." not in spec and ellipsis:
+            raise UnsupportedOperator(
+                "Einsum operand '%s' without the ellipsis the output has is not "
+                "differentiated in reverse" % spec)
+        elsewhere = set(_letters(output))
+        for j, other in enumerate(specs):
+            if j != i:
+                elsewhere |= set(_letters(other))
+        kept = [c for c in letters if c in elsewhere]
+        prefix = "..." if "..." in spec else ""
+        equation = ",".join([output + seed] + [s for j, s in enumerate(specs) if j != i]) + \
+            "->" + prefix + "".join(kept) + seed
+        value = ctx.b.op("Einsum", [seeded] + [n for j, n in enumerate(node.input) if j != i],
+                         stem="a_einsum", equation=equation)
+        lead = ellipsis if prefix else 0
+        dropped = [lead + k for k, c in enumerate(letters) if c not in kept]
+        if dropped:  # summed-away indices come back as axes the adjoint is broadcast along
+            value = ctx.unsqueeze(value, dropped)
+        value = ctx.unbroadcast(value, lead + len(letters), name)
+        contributions.append(ctx.full(value, name))
+    return contributions
