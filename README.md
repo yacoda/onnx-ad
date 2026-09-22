@@ -183,8 +183,9 @@ precision, and `family` builds its second-order file:
 ## Running the result
 
 Reverse mode emits `Transpose` feeding `MatMul`, which ONNX Runtime's extended optimizer
-fuses into `com.microsoft.FusedMatMul` — a kernel registered for `float` only before ONNX
-Runtime 1.30. On a double-precision model with an older runtime, load with the fusions off:
+fuses into `com.microsoft.FusedMatMul`. Through ONNX Runtime 1.19 that kernel exists for
+`float` only (1.30 has a double one), so on a double-precision model with an older runtime
+load with the fusions off:
 
 ```python
 options = ort.SessionOptions()
