@@ -393,8 +393,13 @@ class Context:
             if not root._seeds:
                 raise UnsupportedOperator("no seed tensors: nothing is being differentiated")
             shape = root.b.op("Shape", [root._seeds[0]], stem="seed_shape")
-            root._count = root.b.op(
-                "Slice", [shape, root.b.ints([-1]), root.b.ints([INT64_MAX])], stem="nseed")
+            if root.opset >= 10:
+                root._count = root.b.op(
+                    "Slice", [shape, root.b.ints([-1]), root.b.ints([INT64_MAX])],
+                    stem="nseed")
+            else:  # before opset 10 Slice took its bounds as attributes
+                root._count = root.b.op("Slice", [shape], starts=[-1], ends=[INT64_MAX],
+                                        axes=[0], stem="nseed")
         return root._count
 
     def shape_of(self, name):

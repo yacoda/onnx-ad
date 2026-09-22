@@ -230,5 +230,44 @@ class EinsumTests(Case):
                   [1, 3, 4], [2, 3, 2], [arr("w", RNG.standard_normal((2, 4, 2)))], opset=12)
 
 
+class ResizeTests(Case):
+    """The reverse rule measures each axis's interpolation matrix with the node's own
+    resize, so every mode and coordinate transform is exercised the same way."""
+
+    def resize(self, mode, scales=None, sizes=None, **attrs):
+        inputs = ["x", "", "scales"] if scales is not None else ["x", "", "", "sizes"]
+        initializers = [arr("scales", scales, np.float32)] if scales is not None else \
+            [arr("sizes", sizes, np.int64)]
+        return helper.make_node("Resize", inputs, ["y"], mode=mode, **attrs), initializers
+
+    def test_modes_by_scale(self):
+        for mode, coordinates in (("nearest", "asymmetric"), ("linear", "half_pixel"),
+                                  ("linear", "align_corners"), ("cubic", "half_pixel"),
+                                  ("linear", "pytorch_half_pixel")):
+            with self.subTest(mode=mode, coordinates=coordinates):
+                node, initializers = self.resize(mode, scales=[1, 1, 2, 1.5],
+                                                 coordinate_transformation_mode=coordinates)
+                self.case(node, [1, 2, 3, 4], [1, 2, 6, 6], initializers)
+
+    def test_by_size(self):
+        node, initializers = self.resize("linear", sizes=[1, 2, 5, 7],
+                                         coordinate_transformation_mode="half_pixel")
+        self.case(node, [1, 2, 3, 4], [1, 2, 5, 7], initializers)
+
+    def test_downsampling_with_antialias(self):
+        node, initializers = self.resize("linear", scales=[1, 1, 0.5, 0.5], antialias=1)
+        self.case(node, [1, 1, 6, 6], [1, 1, 3, 3], initializers)
+
+    def test_by_size_in_a_batch(self):
+        # `sizes` names the batch extent too, which the forward rule has to scale by the seeds
+        node, initializers = self.resize("nearest", sizes=[2, 1, 4, 4])
+        self.case(node, [2, 1, 2, 2], [2, 1, 4, 4], initializers)
+
+    def test_upsample(self):
+        node = helper.make_node("Upsample", ["x", "scales"], ["y"], mode="nearest")
+        self.case(node, [1, 1, 2, 3], [1, 1, 4, 6],
+                  [arr("scales", [1, 1, 2, 2], np.float32)], opset=9)
+
+
 if __name__ == "__main__":
     unittest.main()

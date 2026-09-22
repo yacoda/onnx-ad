@@ -2423,3 +2423,155 @@ def _einsum_reverse(ctx, node, grads):
         value = ctx.unbroadcast(value, lead + len(letters), name)
         contributions.append(ctx.full(value, name))
     return contributions
+
+
+# --- Resize and Upsample ---------------------------------------------------------------------
+# Linear in the image, and separable: along each resized axis the output is a fixed
+# interpolation matrix applied to the input. Forward is the same resize of the tangent, one
+# image per seed. Reverse applies each axis's matrix transposed -- and rather than re-derive
+# the matrix for every mode (nearest, linear, cubic), coordinate transform, antialiasing and
+# rounding rule the spec has, it is obtained by running *the node's own* resize on an
+# identity basis laid along that axis: whatever the node does, that is its matrix, exactly.
+
+def _resize_constant(ctx, node, index):
+    if len(node.input) <= index or not node.input[index]:
+        return None
+    value = ctx.values.get(node.input[index])
+    if value is None:
+        raise UnsupportedOperator(
+            "%s is differentiable in reverse mode only with constant roi, scales and sizes"
+            % node.op_type)
+    return value.reshape(-1)
+
+
+def _resize_extents(ctx, node, rank):
+    """Full-rank (scales, sizes, roi) as lists or None, however the node spells them."""
+    if node.op_type == "Upsample":
+        scales = attribute(node, "scales")
+        scales = list(scales) if scales is not None else list(_resize_constant(ctx, node, 1))
+        return scales, None, None
+    axes = attribute(node, "axes")
+    axes = list(range(rank)) if axes is None else [a % rank for a in axes]
+    scales, sizes, roi = [_resize_constant(ctx, node, i) for i in (2, 3, 1)]
+    if scales is not None and scales.size == 0:
+        scales = None
+    if roi is not None and roi.size == 0:
+        roi = None
+
+    def full(values, fill):
+        if values is None:
+            return None
+        out = [fill]*rank
+        for position, axis in enumerate(axes):
+            out[axis] = values[position].item()
+        return out
+
+    full_roi = None
+    if roi is not None:
+        starts, ends = full(roi[:len(axes)], 0.0), full(roi[len(axes):], 1.0)
+        full_roi = starts + ends
+    return full(scales, 1.0), full(sizes, 1), full_roi
+
+
+def _resize_attributes(node):
+    return {a.name: helper.get_attribute_value(a) for a in node.attribute if a.name != "axes"}
+
+
+@forward_rule("Resize", "Upsample")
+def _resize_forward(ctx, node, tangents):
+    x, y = node.input[0], node.output[0]
+    folded = _fold_seed_into_batch(ctx, ctx.full(tangents[0], x), x)
+    operands = [folded] + list(node.input[1:])
+    axes = attribute(node, "axes")
+    if node.op_type == "Resize" and len(node.input) > 3 and node.input[3] and \
+            (axes is None or 0 in [a % ctx.rank(x) for a in axes]):
+        if axes is not None and [a % ctx.rank(x) for a in axes][0] != 0:
+            raise UnsupportedOperator("Resize with sizes for a reordered batch axis")
+        # `sizes` names the batch extent, which now holds every seed direction
+        sizes = node.input[3]
+        head = ctx.b.op("Mul", [ctx.b.op("Slice", [sizes, ctx.b.ints([0]), ctx.b.ints([1])]),
+                                ctx.count()])
+        operands[3] = ctx.b.op("Concat", [head, ctx.b.op(
+            "Slice", [sizes, ctx.b.ints([1]), ctx.b.ints([INT64_MAX])])], axis=0,
+            stem="seeded_sizes")
+    extra = {a.name: helper.get_attribute_value(a) for a in node.attribute}
+    resized = ctx.b.op(node.op_type, operands, stem="t_resize", **extra)
+    return _unfold_batch_into_seed(ctx, resized, y, ctx.rank(y))
+
+
+def _interpolation(ctx, node, axis, scales, sizes, roi, shape_in, shape_out):
+    """The [in, out] transpose of the interpolation matrix the node applies along `axis`."""
+    rank = len(shape_in)
+    basis_axis = 0 if axis != 0 else 1
+    inside, outside = shape_in[axis], shape_out[axis]
+    probe_shape = [1]*rank
+    probe_shape[basis_axis] = inside
+    probe_shape[axis] = inside
+    basis = np.zeros(probe_shape)
+    for i in range(inside):
+        index = [0]*rank
+        index[basis_axis] = index[axis] = i
+        basis[tuple(index)] = 1.0
+    dtype = ctx.dtype(node.input[0])
+    probe = ctx.b.constant(basis, dtype, probe_shape)
+    if node.op_type == "Upsample":
+        factors = [1.0]*rank
+        factors[axis] = scales[axis]
+        operands = [probe] if attribute(node, "scales") is not None else \
+            [probe, ctx.b.constant(factors, TensorProto.FLOAT, (rank,))]
+        extra = {"mode": attribute(node, "mode", "nearest")}
+        if attribute(node, "scales") is not None:
+            extra["scales"] = factors
+        resized = ctx.b.op("Upsample", operands, stem="interpolation", **extra)
+    else:
+        box = ""
+        if roi is not None:
+            window = [0.0]*rank + [1.0]*rank
+            window[axis], window[rank + axis] = roi[axis], roi[rank + axis]
+            box = ctx.b.constant(window, dtype, (2*rank,))
+        if scales is not None:
+            factors = [1.0]*rank
+            factors[axis] = scales[axis]
+            operands = [probe, box, ctx.b.constant(factors, TensorProto.FLOAT, (rank,))]
+        else:
+            extents = list(probe_shape)
+            extents[axis] = outside
+            operands = [probe, box, "", ctx.b.ints(extents)]
+        resized = ctx.b.op("Resize", operands, stem="interpolation", **_resize_attributes(node))
+    if basis_axis < axis:
+        return ctx.b.op("Reshape", [resized, ctx.b.ints([inside, outside])])
+    return ctx.b.op("Transpose", [ctx.b.op("Reshape", [resized, ctx.b.ints([outside, inside])])],
+                    perm=[1, 0])
+
+
+@reverse_rule("Resize", "Upsample")
+def _resize_reverse(ctx, node, grads):
+    x, y = node.input[0], node.output[0]
+    shape_in, shape_out = ctx.shapes.static(x), ctx.shapes.static(y)
+    if shape_in is None or shape_out is None:
+        raise UnsupportedOperator("%s needs declared shapes to be differentiated in reverse"
+                                  % node.op_type)
+    if attribute(node, "keep_aspect_ratio_policy", "stretch") != "stretch":
+        raise UnsupportedOperator(
+            "Resize with a keep_aspect_ratio_policy other than 'stretch' is not differentiated "
+            "in reverse mode")
+    rank = len(shape_in)
+    scales, sizes, roi = _resize_extents(ctx, node, rank)
+    value = ctx.full(grads[0], y)
+    for axis in range(rank):
+        unchanged = shape_in[axis] == shape_out[axis] and \
+            (scales is None or scales[axis] == 1.0) and roi is None
+        if unchanged:
+            continue
+        matrix = _interpolation(ctx, node, axis, scales, sizes, roi, shape_in, shape_out)
+        # contract this axis with the matrix: move it last, MatMul, move it back (MatMul
+        # rather than Einsum, which Upsample's opsets predate)
+        order = [a for a in range(rank + 1) if a != axis] + [axis]
+        back = [0]*(rank + 1)
+        for position, source in enumerate(order):
+            back[source] = position
+        moved = ctx.b.op("Transpose", [value], perm=order)
+        product = ctx.b.op("MatMul", [moved, ctx.b.op("Transpose", [matrix], perm=[1, 0])],
+                           stem="a_resize")
+        value = ctx.b.op("Transpose", [product], perm=back)
+    return [value] + [None]*(len(node.input) - 1)

@@ -1234,9 +1234,8 @@ class SelectionTests(JacobianCase):
             forward(model, inputs=["nope"])
 
     def test_operation_without_a_rule(self):
-        nodes = [helper.make_node("Resize", ["x", "", "s"], ["y"], mode="linear")]
-        model = build(nodes, [("x", [3])], [("y", [6])],
-                      [numpy_helper.from_array(np.array([2.0], dtype=np.float32), "s")])
+        nodes = [helper.make_node("Unique", ["x"], ["y"], sorted=1)]
+        model = build(nodes, [("x", [3])], [("y", [3])])
         with self.assertRaises(UnsupportedOperator):
             forward(model)
         with self.assertRaises(UnsupportedOperator):
