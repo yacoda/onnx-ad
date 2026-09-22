@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "onnx-ad"
+version = "0.1.0"
+description = "Source-code-transforming automatic differentiation on ONNX graphs"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Joris Gillis"}]
+keywords = ["onnx", "automatic-differentiation", "jacobian", "adjoint", "graph-transform"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = ["onnx>=1.14", "numpy>=1.21"]
+
+[project.optional-dependencies]
+test = ["onnxruntime>=1.16"]
+
+[project.scripts]
+onnx-ad = "onnx_ad.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/yacoda/onnx-ad"
+Repository = "https://github.com/yacoda/onnx-ad"
+Issues = "https://github.com/yacoda/onnx-ad/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]

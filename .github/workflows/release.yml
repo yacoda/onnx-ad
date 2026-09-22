@@ -1,0 +1,55 @@
+name: Release
+# Publishes to PyPI with a Trusted Publisher: no API token is stored anywhere. The OIDC
+# identity of this workflow is what PyPI authenticates, and `attestations` adds PEP 740
+# digital attestations of provenance, verifiable against this repository and workflow.
+#
+# Publishing a GitHub release builds and publishes. Running the workflow by hand builds
+# only, and leaves the distributions as an artifact to install and check before tagging.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check --strict dist/*
+      - name: The version must match the tag it is released under
+        if: github.event_name == 'release'
+        run: |
+          version=$(python -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          tag=${GITHUB_REF_NAME#v}
+          test "$version" = "$tag" || { echo "pyproject $version != tag $tag"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+
+  pypi:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/onnx-ad
+    permissions:
+      id-token: write      # the OIDC token the Trusted Publisher exchanges
+      attestations: write  # PEP 740 provenance
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true

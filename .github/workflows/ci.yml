@@ -1,0 +1,58 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e ".[test]"
+      - run: python -m unittest discover -s tests -v
+
+  oldest-supported:
+    # The lower bounds in pyproject.toml have to be real, not aspirational
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - run: python -m pip install "onnx==1.14.*" "numpy==1.21.*" "onnxruntime==1.16.*" .
+      - run: python -m unittest discover -s tests -v
+
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check --strict dist/*
+      - name: The sdist must be able to build and test itself
+        run: |
+          python -m pip install dist/*.whl
+          python -m pip install "onnxruntime>=1.16"
+          cd /tmp && python -c "import onnx_ad; print(onnx_ad.__version__)"
+          python -m onnx_ad --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
