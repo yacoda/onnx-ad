@@ -44,13 +44,22 @@ def build(nodes, inputs, outputs, initializers=(), opset=18, dtype=TensorProto.D
     return model
 
 
+#: ONNX Runtime before 1.19 miscompiles some derivative models in its EliminateIdentity
+#: pass: an expanded GRU's adjoint comes out 0.1 off with basic optimizations on, and exact
+#: with them off -- while 1.19 and 1.30 agree at every level. The model is right; the pass
+#: is disabled on those versions only, so newer runtimes are still tested as users run them.
+_ORT_VERSION = tuple(int(part) for part in ort.__version__.split(".")[:2])
+DISABLED = ["EliminateIdentity"] if _ORT_VERSION < (1, 19) else []
+
+
 def run(model, feeds):
     """ONNX Runtime with its extended fusions off: FusedMatMul has no double kernel."""
     onnx.checker.check_model(model)
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
     session = ort.InferenceSession(model.SerializeToString(), options,
-                                   providers=["CPUExecutionProvider"])
+                                   providers=["CPUExecutionProvider"],
+                                   disabled_optimizers=DISABLED)
     names = [v.name for v in session.get_outputs()]
     return dict(zip(names, session.run(None, feeds)))
 

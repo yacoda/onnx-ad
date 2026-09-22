@@ -183,13 +183,22 @@ precision, and `family` builds its second-order file:
 ## Running the result
 
 Reverse mode emits `Transpose` feeding `MatMul`, which ONNX Runtime's extended optimizer
-fuses into `com.microsoft.FusedMatMul` — a kernel registered for `float` only. On a
-double-precision model, load with the fusions off:
+fuses into `com.microsoft.FusedMatMul` — a kernel registered for `float` only before ONNX
+Runtime 1.30. On a double-precision model with an older runtime, load with the fusions off:
 
 ```python
 options = ort.SessionOptions()
 options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
 session = ort.InferenceSession("adj_f.onnx", options)
+```
+
+**ONNX Runtime before 1.19 miscompiles some derivative models.** Its `EliminateIdentity`
+pass changes the adjoint of an expanded GRU or LSTM by about 0.1 — silently. The model
+itself is correct: unoptimized, every runtime agrees with finite differences, and 1.19 and
+later agree at every optimization level. On an older runtime, disable that one pass:
+
+```python
+session = ort.InferenceSession("adj_f.onnx", options, disabled_optimizers=["EliminateIdentity"])
 ```
 
 ## Command line

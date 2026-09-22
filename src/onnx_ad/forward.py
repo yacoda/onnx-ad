@@ -9,6 +9,7 @@ the primal outputs remain available and the model can be differentiated again.
 from . import control  # noqa: F401 -- registers the If/Scan/Loop rules
 from ._build import (Context, assemble, conventions, rename, seeded_value_info, select)
 from .expand import expand_functions
+from .recurrent import expand_recurrent
 from .unroll import inline_constant_ifs
 from ._passes import forward_nodes
 
@@ -27,6 +28,7 @@ def forward(model, inputs=None, outputs=None, prefix=None, dim=None, layout="cas
     forward pass before. `layout` decides how the seeds are shaped -- see `reverse`.
     """
     prefix, dim = conventions(model, "fwd", prefix, dim)
+    model = expand_recurrent(model)     # RNN, GRU and LSTM as a Scan over their equations
     model = expand_functions(model)     # spec-defined functions, and constant folding
     model = inline_constant_ifs(model)  # a constant condition needs no subgraph at all
     result = type(model)()
