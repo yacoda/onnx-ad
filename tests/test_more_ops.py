@@ -8,11 +8,14 @@ import unittest
 
 import numpy as np
 import onnx
+import onnxruntime as ort
 from onnx import TensorProto, helper, numpy_helper
 
+from onnx_ad.lower import LOWERINGS, lower
 from test_ad import IR_VERSION, MAX_OPSET, JacobianCase, run
 
 RNG = np.random.default_rng(17)
+OLD_ORT = tuple(int(v) for v in ort.__version__.split(".")[:2]) < (1, 19)
 try:
     CUMPROD = onnx.defs.get_schema("CumProd").since_version
 except Exception:
@@ -306,6 +309,216 @@ class DFTTests(Case):
             self.skipTest("DFT takes its axis as an input from opset 20")
         node = helper.make_node("DFT", ["x", "", "a"], ["y"])
         self.case(node, [2, 6, 2], [2, 6, 2], [arr("a", 1, np.int64)], opset=20)
+
+
+class GatherLikeTests(Case):
+    """Operations that move elements: Unique, MaxUnpool, Col2Im -- and DequantizeLinear,
+    differentiated in its scale."""
+
+    def test_unique(self):
+        for attrs, y_shape in (({}, [6]), ({"axis": 1}, [2, 3]), ({"sorted": 0}, [6])):
+            with self.subTest(**attrs):
+                self.case(helper.make_node("Unique", ["x"], ["y"], **attrs), [2, 3], y_shape)
+
+    def test_unique_with_duplicates(self):
+        # the first occurrence carries the derivative; finite differences cannot see that,
+        # as perturbing a duplicate changes the output's size
+        x = np.array([3.0, 1.0, 3.0, 2.0, 1.0])
+        model = build(helper.make_node("Unique", ["x"], ["y", "i", "inv", "c"]), [5], [3],
+                      outputs=[helper.make_tensor_value_info("y", TensorProto.DOUBLE, [3])])
+        expected = np.zeros((3, 5))
+        expected[0, 1] = expected[1, 3] = expected[2, 0] = 1.0
+        self.check(model, {"x": x}, expected, differences=False)
+
+    def test_max_unpool(self):
+        indices = arr("i", [[[[0, 3], [9, 14]]]], np.int64)
+        self.case(helper.make_node("MaxUnpool", ["x", "i"], ["y"], kernel_shape=[2, 2],
+                                   strides=[2, 2]), [1, 1, 2, 2], [1, 1, 4, 4], [indices])
+
+    def test_max_unpool_after_overlapping_windows(self):
+        # windows of 3 with stride 1 on a peaked input report the peak more than once
+        x = np.array([[[[0.0, 1.0, 0.5, 0.2], [0.1, 9.0, 0.3, 0.4], [0.2, 0.1, 0.6, 8.0],
+                        [0.3, 0.2, 0.7, 0.8]]]])
+        pool = helper.make_node("MaxPool", ["x"], ["p", "i"], kernel_shape=[3, 3])
+        unpool = helper.make_node("MaxUnpool", ["p", "i", "s"], ["y"], kernel_shape=[3, 3])
+        self.case([pool, unpool], [1, 1, 4, 4], [1, 1, 4, 4],
+                  [arr("s", [1, 1, 4, 4], np.int64)], x=x)
+
+    def test_col2im(self):
+        if MAX_OPSET < 18:
+            self.skipTest("Col2Im is opset 18")
+        for attrs, image, cols in (({}, [4, 5], 9), ({"strides": [2, 1]}, [5, 5], 6),
+                                   ({"pads": [1, 0, 1, 1], "dilations": [1, 2]}, [4, 5], 10)):
+            with self.subTest(**attrs):
+                self.case(helper.make_node("Col2Im", ["x", "img", "blk"], ["y"], **attrs),
+                          [1, 2*6, cols], [1, 2] + image,
+                          [arr("img", image, np.int64), arr("blk", [2, 3], np.int64)])
+
+    def test_dequantize_linear(self):
+        q = arr("q", RNG.integers(-100, 100, (2, 3, 4)), np.int8)
+        zp = arr("zp", [3, -2, 0], np.int8)
+        with self.subTest("per axis"):
+            self.case(helper.make_node("DequantizeLinear", ["q", "x", "zp"], ["y"], axis=1),
+                      [3], [2, 3, 4], [q, zp], opset=13, x=np.array([0.1, 0.2, 0.05]))
+        with self.subTest("per tensor"):
+            self.case(helper.make_node("DequantizeLinear", ["q", "x"], ["y"]), [], [2, 3, 4],
+                      [q], x=np.array(0.1))
+
+
+class LoweredCase(Case):
+    """Lowered operations: the lowered primal against the runtime's own kernel (or the ONNX
+    reference implementation where the runtime has none), then the derivatives in double,
+    through the lowering, which runs in double whatever kernels the runtime lacks."""
+
+    def lowered(self, nodes, x_shape, y_shape, initializers=(), opset=18, x=None,
+                primal_tol=1e-12, expected=None):
+        if opset > MAX_OPSET:
+            self.skipTest("opset %d is newer than this onnx" % opset)
+        x = RNG.standard_normal(x_shape) if x is None else x
+        model = build(nodes, x_shape, y_shape, initializers, opset)
+        lowered = lower(model)
+        self.assertFalse({n.op_type for n in lowered.graph.node} & set(LOWERINGS))
+        if not runs(lowered, {"x": x}):
+            self.skipTest("this ONNX Runtime does not load opset %d" % opset)
+        got = run(lowered, {"x": x})["y"]
+        single = build(nodes, x_shape, y_shape, [
+            numpy_helper.from_array(numpy_helper.to_array(t).astype(np.float32), t.name)
+            if numpy_helper.to_array(t).dtype == np.float64 else t
+            for t in initializers], opset, dtype=TensorProto.FLOAT)
+        if expected is not None:
+            pass
+        elif runs(model, {"x": x}):
+            expected = run(model, {"x": x})["y"]
+        elif runs(single, {"x": x.astype(np.float32)}):
+            expected = run(single, {"x": x.astype(np.float32)})["y"]
+            primal_tol = max(primal_tol, 2e-5)
+        else:  # the reference implementation, where no runtime kernel exists
+            from onnx.reference import ReferenceEvaluator
+            expected = ReferenceEvaluator(model).run(None, {"x": x})[0]
+        np.testing.assert_allclose(got, expected, rtol=primal_tol, atol=primal_tol)
+        return self.check(lowered, {"x": x}, fd_tol=1e-5)
+
+
+class LRNTests(LoweredCase):
+    def test_sizes(self):
+        for size in (1, 3, 5):
+            with self.subTest(size=size):
+                self.lowered(helper.make_node("LRN", ["x"], ["y"], size=size, alpha=0.3,
+                                              beta=0.6, bias=1.5), [2, 6, 3, 2], [2, 6, 3, 2],
+                             primal_tol=1e-6)
+
+    def test_even_size(self):
+        # ONNX Runtime refuses even sizes and the reference implementation centres the window
+        # differently from the spec, so the spec's own formula is the reference: the window
+        # is [c - floor((size-1)/2), c + ceil((size-1)/2)], here [c, c + 1]
+        x = RNG.standard_normal((2, 5, 3, 2))
+        square = np.pad(x**2, [(0, 0), (0, 1), (0, 0), (0, 0)])
+        total = square[:, :-1] + square[:, 1:]
+        self.lowered(helper.make_node("LRN", ["x"], ["y"], size=2, alpha=0.3, beta=0.6,
+                                      bias=1.5), [2, 5, 3, 2], [2, 5, 3, 2], x=x,
+                     expected=x*(1.5 + 0.3/2*total)**-0.6, primal_tol=1e-6)
+
+    def test_old_opset(self):
+        self.lowered(helper.make_node("LRN", ["x"], ["y"], size=3), [1, 4, 5, 2], [1, 4, 5, 2],
+                     opset=9, primal_tol=1e-6)
+
+
+class GridSampleTests(LoweredCase):
+    IMAGE = RNG.standard_normal((2, 3, 4, 5))
+
+    def sample(self, grid_input, opset=20, **attrs):
+        """Differentiated in the grid (the image a constant), or the other way round."""
+        if opset > MAX_OPSET:  # the same modes, under their opset 16 names
+            opset = 16
+            attrs["mode"] = {"linear": "bilinear", "cubic": "bicubic"}.get(
+                attrs.get("mode"), attrs.get("mode"))
+            attrs = {k: v for k, v in attrs.items() if v is not None}
+        grid = RNG.uniform(-1.3, 1.3, (2, 3, 2, 2))
+        if grid_input:
+            node = helper.make_node("GridSample", ["img", "x"], ["y"], **attrs)
+            return self.lowered(node, [2, 3, 2, 2], [2, 3, 3, 2], [arr("img", self.IMAGE)],
+                                opset=opset, x=grid, primal_tol=2e-5)
+        node = helper.make_node("GridSample", ["x", "grid"], ["y"], **attrs)
+        return self.lowered(node, [2, 3, 4, 5], [2, 3, 3, 2], [arr("grid", grid)],
+                            opset=opset, x=self.IMAGE, primal_tol=2e-5)
+
+    def test_modes(self):
+        for mode in ("linear", "nearest", "cubic"):
+            for padding in ("zeros", "border", "reflection"):
+                for aligned in (0, 1):
+                    for grid_input in (False, True):
+                        with self.subTest(mode=mode, padding=padding, aligned=aligned,
+                                          grid=grid_input):
+                            if (mode, padding) == ("cubic", "border") and OLD_ORT:
+                                self.skipTest("ONNX Runtime before 1.19 clamps a cubic's "
+                                              "coordinate as well as its taps; later "
+                                              "versions and PyTorch clamp only the taps")
+                            self.sample(grid_input, mode=mode, padding_mode=padding,
+                                        align_corners=aligned)
+
+    def test_opset_16_names(self):
+        for mode in ("bilinear", "bicubic"):
+            with self.subTest(mode=mode):
+                self.sample(True, opset=16, mode=mode)
+
+    def test_spatial_transformer(self):
+        # AffineGrid expands to a body that branches on a condition folding to a constant;
+        # the branch taken must fold in turn, or the grid loses its shape
+        if MAX_OPSET < 20:
+            self.skipTest("AffineGrid is opset 20")
+        theta = np.eye(2, 3)*1.3 + 0.2*RNG.standard_normal((2, 2, 3))
+        nodes = [helper.make_node("AffineGrid", ["x", "size"], ["grid"]),
+                 helper.make_node("GridSample", ["img", "grid"], ["y"], mode="cubic",
+                                  padding_mode="reflection")]
+        self.lowered(nodes, [2, 2, 3], [2, 3, 6, 7],
+                     [arr("size", [2, 3, 6, 7], np.int64), arr("img", self.IMAGE)], opset=20,
+                     x=theta, primal_tol=2e-5)
+
+    def test_volumetric(self):
+        grid = RNG.uniform(-1.1, 1.1, (1, 2, 3, 2, 3))
+        node = helper.make_node("GridSample", ["img", "x"], ["y"], mode="linear")
+        self.lowered(node, [1, 2, 3, 2, 3], [1, 2, 2, 3, 2],
+                     [arr("img", RNG.standard_normal((1, 2, 3, 4, 3)))], opset=20, x=grid,
+                     primal_tol=2e-5)
+
+
+class STFTTests(LoweredCase):
+    def test_windowed(self):
+        window = arr("w", np.hanning(6))
+        for onesided, bins in ((1, 4), (0, 6)):
+            with self.subTest(onesided=onesided):
+                self.lowered(helper.make_node("STFT", ["x", "step", "w"], ["y"],
+                                              onesided=onesided),
+                             [2, 16, 1], [2, 6, bins, 2],
+                             [arr("step", 2, np.int64), window], opset=17, primal_tol=1e-9)
+
+    def test_frame_length_and_complex_signal(self):
+        # against numpy: ONNX Runtime 1.19's STFT scrambles the frames of a complex signal
+        x = RNG.standard_normal((1, 10, 2))
+        signal = x[..., 0] + 1j*x[..., 1]
+        frames = np.stack([np.fft.fft(signal[:, 3*f:3*f + 4]) for f in range(3)], axis=1)
+        self.lowered(helper.make_node("STFT", ["x", "step", "", "n"], ["y"], onesided=0),
+                     [1, 10, 2], [1, 3, 4, 2],
+                     [arr("step", 3, np.int64), arr("n", 4, np.int64)], opset=17, x=x,
+                     primal_tol=1e-9, expected=np.stack([frames.real, frames.imag], -1))
+
+
+class TensorScatterTests(LoweredCase):
+    def scatter(self, mode, written):
+        cache = arr("cache", RNG.standard_normal((2, 3, 5, 4)))
+        indices = [arr("wi", written, np.int64)] if written is not None else []
+        node = helper.make_node("TensorScatter", ["cache", "x"] + (["wi"] if indices else []),
+                                ["y"], mode=mode)
+        self.lowered(node, [2, 3, 2, 4], [2, 3, 5, 4], [cache] + indices, opset=24)
+
+    def test_linear(self):
+        self.scatter("linear", [1, 3])
+
+    def test_circular(self):
+        self.scatter("circular", [4, 2])
+
+    def test_from_the_start(self):
+        self.scatter("linear", None)
 
 
 if __name__ == "__main__":

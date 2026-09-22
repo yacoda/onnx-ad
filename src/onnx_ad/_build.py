@@ -356,12 +356,28 @@ class Context:
     def unsqueeze(self, value, axes):
         if self.opset >= 13:
             return self.b.op("Unsqueeze", [value, self.b.ints(axes)])
+        if self.opset < 11 and any(a < 0 for a in axes):
+            # negative axes arrived in opset 11; before, Unsqueeze ignores them silently
+            if list(axes) == [-1] and self.shapes.shape(value) is None:
+                shape = self.b.op("Concat", [self.b.op("Shape", [value]), self.b.ints([1])],
+                                  axis=0, stem="trailing")
+                return self.b.op("Reshape", [value, shape], stem="unsqueezed")
+            rank = self.shapes.rank(value) + len(axes)
+            axes = [a % rank for a in axes]
         return self.b.op("Unsqueeze", [value], axes=list(axes))
 
     def squeeze(self, value, axes):
         if self.opset >= 13:
             return self.b.op("Squeeze", [value, self.b.ints(axes)])
         return self.b.op("Squeeze", [value], axes=list(axes))
+
+    def slice(self, value, starts, ends, axes, stem="slice"):
+        """Slice with constant bounds; before opset 10 they were attributes."""
+        if self.opset >= 10:
+            return self.b.op("Slice", [value, self.b.ints(starts), self.b.ints(ends),
+                                       self.b.ints(axes)], stem=stem)
+        return self.b.op("Slice", [value], starts=list(starts), ends=list(ends),
+                         axes=list(axes), stem=stem)
 
     def reduce_sum(self, value, axes, keepdims=1):
         """ReduceSum with a possibly dynamic axes tensor (an empty one means: reduce nothing)."""
@@ -370,6 +386,10 @@ class Context:
                 axes = self.b.ints(axes)
             return self.b.op("ReduceSum", [value, axes], keepdims=keepdims,
                              noop_with_empty_axes=1)
+        if isinstance(axes, str):
+            raise UnsupportedOperator(
+                "before opset 13 ReduceSum takes its axes as an attribute, so broadcasting "
+                "against a value of unknown shape cannot be undone; declare the shapes")
         return self.b.op("ReduceSum", [value], axes=list(axes), keepdims=keepdims)
 
     def reduce_mean(self, value, axes, keepdims=1):

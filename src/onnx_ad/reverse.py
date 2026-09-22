@@ -13,6 +13,7 @@ function of `(x, adj_y)` -- no `uses_output` convention, and it can be different
 from . import control  # noqa: F401 -- registers the If/Scan/Loop rules
 from ._build import (Context, assemble, conventions, rename, seeded_value_info, select)
 from .expand import expand_functions
+from .lower import lower
 from .recurrent import expand_recurrent
 from .unroll import inline_constant_ifs
 from ._passes import reverse_nodes
@@ -38,6 +39,7 @@ def reverse(model, inputs=None, outputs=None, prefix=None, dim=None, layout="cas
     """
     prefix, dim = conventions(model, "adj", prefix, dim)
     model = expand_recurrent(model)     # RNN, GRU and LSTM as a Scan over their equations
+    model = lower(model)                # LRN, GridSample, STFT, TensorScatter
     model = expand_functions(model)     # spec-defined functions, and constant folding
     model = inline_constant_ifs(model)  # a constant condition needs no subgraph at all
     result = type(model)()

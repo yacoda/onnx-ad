@@ -488,9 +488,7 @@ def _concat_reverse(ctx, node, grads):
             raise UnsupportedOperator(
                 "Concat is differentiable in reverse only where the concatenated extent of "
                 "each operand is declared; '%s' has none" % name)
-        contributions.append(ctx.b.op("Slice", [
-            seeded, ctx.b.ints([offset]), ctx.b.ints([offset + shape[axis]]),
-            ctx.b.ints([axis])]))
+        contributions.append(ctx.slice(seeded, [offset], [offset + shape[axis]], [axis]))
         offset += shape[axis]
     return contributions
 
@@ -1061,12 +1059,19 @@ def _split_reverse(ctx, node, grads):
     return [ctx.b.op("Concat", pieces, axis=axis)] + [None]*(len(node.input) - 1)
 
 
+def _slice_bounds(ctx, node):
+    """(starts, ends, axes, steps), from the operands -- or, before opset 10, attributes."""
+    if len(node.input) == 1:
+        axes = attribute(node, "axes")
+        return (list(attribute(node, "starts")), list(attribute(node, "ends")),
+                None if axes is None else list(axes), None)
+    return (_constant_operand(ctx, node, 1, "starts"), _constant_operand(ctx, node, 2, "ends"),
+            _constant_operand(ctx, node, 3, "axes"), _constant_operand(ctx, node, 4, "steps"))
+
+
 def _slice_extent(ctx, node):
     """The per-axis (before, after) zero padding that undoes the slice."""
-    starts = _constant_operand(ctx, node, 1, "starts")
-    ends = _constant_operand(ctx, node, 2, "ends")
-    axes = _constant_operand(ctx, node, 3, "axes")
-    steps = _constant_operand(ctx, node, 4, "steps")
+    starts, ends, axes, steps = _slice_bounds(ctx, node)
     if starts is None or ends is None:
         raise UnsupportedOperator("Slice is differentiable only with constant bounds")
     if steps is not None and any(step != 1 for step in steps):
@@ -1090,6 +1095,10 @@ def _slice_extent(ctx, node):
 @forward_rule("Slice")
 def _slice_forward(ctx, node, tangents):
     seeded = ctx.full(tangents[0], node.input[0])
+    if len(node.input) == 1:  # opset < 10: the bounds are attributes; axes default to leading
+        starts, ends, axes, _ = _slice_bounds(ctx, node)
+        extra = {} if axes is None else {"axes": [a % ctx.rank(node.input[0]) for a in axes]}
+        return ctx.b.op("Slice", [seeded], starts=starts, ends=ends, stem="t_slice", **extra)
     operands = [seeded] + list(node.input[1:])
     axes = _constant_operand(ctx, node, 3, "axes")
     if axes is not None:  # a negative axis would land on the seed axis
@@ -1153,11 +1162,9 @@ def _pad_reverse(ctx, node, grads):
     before, after = _pad_widths(ctx, node)
     rank = ctx.rank(node.input[0])
     seeded = ctx.full(grads[0], node.output[0])
-    starts = ctx.b.ints([max(b, 0) for b in before])
-    ends = ctx.b.ints([INT64_MAX if a <= 0 else -a for a in after])
-    axes = ctx.b.ints(list(range(rank)))
-    return [ctx.b.op("Slice", [seeded, starts, ends, axes], stem="a_pad")] + \
-        [None]*(len(node.input) - 1)
+    return [ctx.slice(seeded, [max(b, 0) for b in before],
+                      [INT64_MAX if a <= 0 else -a for a in after], list(range(rank)),
+                      stem="a_pad")] + [None]*(len(node.input) - 1)
 
 
 @forward_rule("Tile")
@@ -2678,3 +2685,196 @@ def _dft_reverse(ctx, node, grads):
         value = ctx.b.op("Slice", [value, ctx.b.ints([0]), ctx.b.ints([1]),
                                    ctx.b.ints([rank])])
     return [_seed_back(ctx, value, rank)] + [None]*(len(node.input) - 1)
+
+
+# --- Unique ----------------------------------------------------------------------------------
+# The unique values are the input gathered at the first occurrences Unique itself reports --
+# the derivative that choice implies (a perturbation splitting two equal values is not
+# differentiable anyway).
+
+def _unique_as_gather(ctx, node):
+    """(data, first-occurrence indices, axis) with the data flattened when there is no axis;
+    a second Unique is emitted when the node's own indices output was not asked for."""
+    data = node.input[0]
+    indices = node.output[1] if len(node.output) > 1 and node.output[1] else None
+    if indices is None:
+        extra = {a.name: helper.get_attribute_value(a) for a in node.attribute}
+        indices = ctx.b.op("Unique", [data], outputs=4, stem="unique", **extra)[1]
+        ctx.shapes.declare(indices, [None], TensorProto.INT64)
+    axis = attribute(node, "axis")
+    if axis is None:
+        flat = ctx.b.op("Reshape", [data, ctx.b.ints([-1])], stem="flat")
+        static = ctx.shapes.static(data)
+        ctx.shapes.declare(flat, [int(np.prod(static)) if static is not None else None],
+                           ctx.shapes.dtype(data))
+        return flat, indices, 0
+    return data, indices, axis % ctx.rank(data)
+
+
+@forward_rule("Unique")
+def _unique_forward(ctx, node, tangents):
+    data, indices, axis = _unique_as_gather(ctx, node)
+    seeded = ctx.full(tangents[0], node.input[0])
+    if data != node.input[0]:
+        seeded = ctx.reshape_like(seeded, data)
+    return [ctx.b.op("Gather", [seeded, indices], axis=axis, stem="t_unique")] + \
+        [None]*(len(node.output) - 1)
+
+
+@reverse_rule("Unique")
+def _unique_reverse(ctx, node, grads):
+    if grads[0] is None:
+        return [None]
+    data, indices, axis = _unique_as_gather(ctx, node)
+    gather = helper.make_node("Gather", [data, indices], [node.output[0]], axis=axis)
+    scattered = _gather_reverse(ctx, gather, grads[:1])[0]
+    if data != node.input[0]:
+        scattered = ctx.reshape_like(scattered, node.input[0])
+    return [scattered]
+
+
+# --- MaxUnpool -------------------------------------------------------------------------------
+# A scatter of X into zeros at indices flattened over the whole output. Overlapping pooling
+# windows can report one position twice (with equal values), and which write wins is then
+# unspecified; both modes use the same winner, found by scattering each element's own
+# position, so they stay each other's transpose.
+
+def _unpool_parts(ctx, node):
+    x, indices, y = node.input[0], node.input[1], node.output[0]
+    flat = ctx.b.op("Reshape", [indices, ctx.b.ints([-1])], stem="flat_indices")
+    size = ctx.b.op("Reshape", [ctx.b.op("Size", [y]), ctx.b.ints([1])], stem="numel")
+    mask = None
+    if ctx.opset >= 16:
+        count = ctx.b.op("Reshape", [ctx.b.op("Size", [x]), ctx.b.ints([1])], stem="count")
+        positions = ctx.b.op("Range", [ctx.b.constant(0, TensorProto.INT64, ()),
+                                       ctx.squeeze(count, [0]),
+                                       ctx.b.constant(1, TensorProto.INT64, ())])
+        owner = ctx.b.op("ScatterND", [ctx.b.op("Expand", [ctx.b.ints([-1]), size]),
+                                       ctx.unsqueeze(flat, [-1]), positions], stem="owner")
+        won = ctx.b.op("Equal", [ctx.b.op("Gather", [owner, flat], axis=0), positions])
+        mask = ctx.unsqueeze(ctx.b.op("Cast", [won], to=ctx.dtype(x)), [-1])
+    return flat, size, mask
+
+
+@forward_rule("MaxUnpool")
+def _max_unpool_forward(ctx, node, tangents):
+    x, y = node.input[0], node.output[0]
+    flat, size, mask = _unpool_parts(ctx, node)
+    values = ctx.b.op("Reshape", [ctx.full(tangents[0], x), ctx.b.op(
+        "Concat", [ctx.b.ints([-1]), ctx.count()], axis=0)], stem="flat_tangent")
+    extra = {}
+    if mask is not None:
+        values = ctx.b.op("Mul", [values, mask])
+        extra = {"reduction": "add"}
+    zeros = ctx.b.op("ConstantOfShape", [ctx.b.op("Concat", [size, ctx.count()], axis=0)],
+                     value=helper.make_tensor("zero", ctx.dtype(x), [1], [0]), stem="zeros")
+    scattered = ctx.b.op("ScatterND", [zeros, ctx.unsqueeze(flat, [-1]), values],
+                         stem="t_maxunpool", **extra)
+    return ctx.reshape_like(scattered, y)
+
+
+@reverse_rule("MaxUnpool")
+def _max_unpool_reverse(ctx, node, grads):
+    x, y = node.input[0], node.output[0]
+    flat, _, mask = _unpool_parts(ctx, node)
+    values = ctx.b.op("Reshape", [ctx.full(grads[0], y), ctx.b.op(
+        "Concat", [ctx.b.ints([-1]), ctx.count()], axis=0)], stem="flat_adjoint")
+    gathered = ctx.b.op("Gather", [values, flat], axis=0, stem="a_maxunpool")
+    if mask is not None:
+        gathered = ctx.b.op("Mul", [gathered, mask])
+    return [ctx.reshape_like(gathered, x), None, None]
+
+
+# --- Col2Im ----------------------------------------------------------------------------------
+# Linear in its input: forward is Col2Im itself, one image per seed. The adjoint is im2col,
+# which ONNX spells as a grouped convolution with one-hot kernels -- output channel c*K + k
+# picks block position k of channel c, the order Col2Im reads its columns in.
+
+def _col2im_parts(ctx, node):
+    block = ctx.integers(node.input[2])
+    image = ctx.integers(node.input[1])
+    static = ctx.shapes.static(node.input[0])
+    if block is None or image is None or static is None:
+        raise UnsupportedOperator("Col2Im needs constant image and block shapes and a "
+                                  "declared input shape to be differentiated")
+    spatial = len(block)
+    attrs = {"strides": list(attribute(node, "strides", [1]*spatial)),
+             "dilations": list(attribute(node, "dilations", [1]*spatial)),
+             "pads": list(attribute(node, "pads", [0]*(2*spatial)))}
+    return block, image, int(static[1]) // int(np.prod(block)), attrs
+
+
+@forward_rule("Col2Im")
+def _col2im_forward(ctx, node, tangents):
+    x, y = node.input[0], node.output[0]
+    folded = _fold_seed_into_batch(ctx, ctx.full(tangents[0], x), x)
+    image = ctx.b.op("Col2Im", [folded, node.input[1], node.input[2]], stem="t_col2im",
+                     **{a.name: helper.get_attribute_value(a) for a in node.attribute})
+    return _unfold_batch_into_seed(ctx, image, y, ctx.rank(y))
+
+
+@reverse_rule("Col2Im")
+def _col2im_reverse(ctx, node, grads):
+    x, y = node.input[0], node.output[0]
+    block, image, channels, attrs = _col2im_parts(ctx, node)
+    positions = int(np.prod(block))
+    kernel = np.zeros([channels*positions, 1] + block)
+    for c in range(channels):
+        for k in range(positions):
+            kernel[(c*positions + k, 0) + np.unravel_index(k, block)] = 1.0
+    weight = ctx.b.constant(kernel, ctx.dtype(x), kernel.shape)
+    folded = _fold_seed_into_batch(ctx, ctx.full(grads[0], y), y)
+    columns = ctx.b.op("Conv", [folded, weight], group=channels, kernel_shape=block,
+                       stem="im2col", **attrs)
+    columns = ctx.b.op("Reshape", [columns, ctx.b.ints([0, channels*positions, -1])])
+    return [_unfold_batch_into_seed(ctx, columns, x, ctx.rank(x)), None, None]
+
+
+# --- DequantizeLinear ----------------------------------------------------------------------
+# (x - zero_point) * scale: the quantized x and its zero point are integers, so only the scale
+# carries a derivative, times the dequantized value at unit scale. Per-tensor and per-axis
+# scales are supported; blocked ones (opset 21's block_size) are refused.
+
+def _dequantize_parts(ctx, node):
+    """x - zero_point, as the scale's type: the dequantized value at unit scale. Spelled out
+    rather than as a DequantizeLinear by a scale of ones, which ONNX Runtime 1.19's graph
+    optimizations fold wrongly (negative int8 values become 0)."""
+    x, scale = node.input[0], node.input[1]
+    if attribute(node, "block_size", 0):
+        raise UnsupportedOperator("DequantizeLinear with block_size is not differentiated")
+    dtype = ctx.shapes.dtype(scale)
+    rank = ctx.rank(x)
+    axis = None if ctx.rank(scale) == 0 else attribute(node, "axis", 1) % rank
+    if axis is not None and ctx.shapes.static(scale) == (1,) and rank != 1:
+        axis = None  # a one-element scale broadcasts like a scalar
+    unit = ctx.b.op("Cast", [x], to=dtype, stem="unit")
+    if len(node.input) > 2 and node.input[2]:
+        point = ctx.b.op("Cast", [node.input[2]], to=dtype, stem="zero_point")
+        if axis is not None:
+            point = ctx.unsqueeze(point, [a for a in range(rank) if a != axis])
+        unit = ctx.b.op("Sub", [unit, point], stem="unit")
+    return unit, axis, rank
+
+
+@forward_rule("DequantizeLinear")
+def _dequantize_forward(ctx, node, tangents):
+    if tangents[1] is None:
+        return None
+    unit, axis, rank = _dequantize_parts(ctx, node)
+    tangent = tangents[1]
+    if axis is not None:  # [C, nseed] -> [1, .., C, .., 1, nseed]
+        tangent = ctx.unsqueeze(tangent, [a for a in range(rank) if a != axis])
+    return ctx.b.op("Mul", [ctx.lift(unit), tangent], stem="t_dequantize")
+
+
+@reverse_rule("DequantizeLinear")
+def _dequantize_reverse(ctx, node, grads):
+    rest = [None]*(len(node.input) - 2)
+    if not ctx.asked_for(node.input[1]):
+        return [None, None] + rest
+    unit, axis, rank = _dequantize_parts(ctx, node)
+    product = ctx.b.op("Mul", [ctx.full(grads[0], node.output[0]), ctx.lift(unit)])
+    axes = [a for a in range(rank) if a != axis]
+    reduced = ctx.reduce_sum(product, axes, keepdims=0) if axes else product
+    scale = node.input[1]
+    return [None, ctx.reshape_like(reduced, scale)] + rest

@@ -1243,8 +1243,8 @@ class SelectionTests(JacobianCase):
             forward(model, inputs=["nope"])
 
     def test_operation_without_a_rule(self):
-        nodes = [helper.make_node("Unique", ["x"], ["y"], sorted=1)]
-        model = build(nodes, [("x", [3])], [("y", [3])])
+        nodes = [helper.make_node("MaxRoiPool", ["x", "r"], ["y"], pooled_shape=[1, 1])]
+        model = build(nodes, [("x", [1, 1, 3, 3]), ("r", [1, 5])], [("y", [1, 1, 1, 1])])
         with self.assertRaises(UnsupportedOperator):
             forward(model)
         with self.assertRaises(UnsupportedOperator):

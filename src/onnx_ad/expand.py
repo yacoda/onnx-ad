@@ -16,7 +16,7 @@ from ._build import FLOAT_TYPES, Builder, Shapes
 from ._graph import all_constants, all_names, node_reads, subgraphs
 from .fold import fold_constants
 from .rules import FORWARD
-from .unroll import _substitute
+from .unroll import _substitute, inline_constant_ifs
 
 
 def expand_functions(model):
@@ -28,10 +28,20 @@ def expand_functions(model):
     needs the rounds for a context-dependent function inside a body (SoftmaxCrossEntropyLoss
     calls NegativeLogLikelihoodLoss), which can only be generated once inference has typed
     the body. Nodes in custom domains, and operations with a rule, are left as they are.
+
+    A body often branches on a condition that folds to a constant -- AffineGrid on whether it
+    is 2-D -- so a constant `If` is inlined as part of the same fixed point, and the taken
+    branch's own shape arithmetic then folds too: shape inference cannot see through a
+    `Concat` of constants into an `Expand` target, and everything after it would lose its
+    shape.
     """
     opset = max([o.version for o in model.opset_import if o.domain in ("", "ai.onnx")] or [18])
-    for _ in range(12):
+    for _ in range(24):
         model = fold_constants(model)
+        inlined = inline_constant_ifs(model)
+        if inlined is not model:
+            model = inlined  # the branch's shape arithmetic folds in the next round
+            continue
         state = _Expander(model, opset)
         nodes = state.nodes(list(model.graph.node))
         if not state.changed:
