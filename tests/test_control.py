@@ -181,6 +181,14 @@ class IfTests(JacobianCase):
                            "fwd_x": np.eye(3)})["fwd_adj_x"]
         np.testing.assert_allclose(got.reshape(3, 3), np.diag(6*x), rtol=1e-12, atol=1e-12)
 
+    def test_a_constant_condition_is_inlined(self):
+        # nothing is left to recurse into: the taken branch becomes part of the flat graph
+        for condition in (True, False):
+            with self.subTest(condition=condition):
+                m = self.two_branch_model(condition)
+                for derivative in (forward(m), reverse(m)):
+                    self.assertNotIn("If", {n.op_type for n in derivative.graph.node})
+
     def test_only_the_taken_branch_is_evaluated(self):
         # the derivative of the untaken branch would divide by zero; it must never run
         then = branch([helper.make_node("Exp", ["x"], ["e"])], [vi("e", [3])], "then")
@@ -291,6 +299,17 @@ class ScanTests(JacobianCase):
         # the second iteration on, which only the loop-carried fixed point discovers
         m, feeds = rnn_scan(["xs"])
         self.check_scan(m, feeds, "xs", "sf")
+
+    def test_unrolling_a_derivative_model(self):
+        # a generated body carries its own constants; unrolling has to hoist them
+        m, feeds = rnn_scan(["xs"], steps=3)
+        adjoint = reverse(m, outputs=["sf"])
+        flat = unroll(adjoint)
+        self.assertNotIn("Scan", {node.op_type for node in flat.graph.node})
+        onnx.checker.check_model(flat)
+        feeds_ = dict(feeds, adj_sf=RNG.standard_normal((3, 1)))
+        np.testing.assert_allclose(run(flat, feeds_)["adj_xs"], run(adjoint, feeds_)["adj_xs"],
+                                   rtol=1e-12, atol=1e-13)
 
     def test_forward_over_adjoint_through_a_scan(self):
         m, feeds = rnn_scan(["xs"], steps=3, width=2)

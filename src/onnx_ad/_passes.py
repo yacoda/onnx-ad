@@ -108,7 +108,10 @@ def reverse_nodes(ctx, nodes, seeds, differentiated):
         ctx.wanted = None
 
     results = {name: take(name) for name in list(pending)}
-    primal = [ctx._replacements.get(id(node), node) for node in nodes]
+    primal = []
+    for node in nodes:
+        original, replacement = ctx._replacements.get(id(node), (None, None))
+        primal.append(replacement if original is node else node)
     adjoint = ctx.b.nodes
     ctx.b.nodes = []
     ctx._replacements = {}

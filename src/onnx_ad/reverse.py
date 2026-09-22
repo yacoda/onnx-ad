@@ -12,6 +12,7 @@ function of `(x, adj_y)` -- no `uses_output` convention, and it can be different
 """
 from . import control  # noqa: F401 -- registers the If/Scan/Loop rules
 from ._build import (Context, assemble, conventions, rename, seeded_value_info, select)
+from .unroll import inline_constant_ifs
 from ._passes import reverse_nodes
 
 
@@ -34,6 +35,7 @@ def reverse(model, inputs=None, outputs=None, prefix=None, dim=None, layout="cas
     directly.
     """
     prefix, dim = conventions(model, "adj", prefix, dim)
+    model = inline_constant_ifs(model)  # a constant condition needs no subgraph at all
     result = type(model)()
     result.CopyFrom(model)
     graph = result.graph

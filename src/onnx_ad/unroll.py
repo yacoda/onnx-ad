@@ -14,7 +14,7 @@ are.
 from onnx import TensorProto, helper
 
 from ._build import Builder, Shapes, attribute
-from ._graph import all_constants, all_names, defines, subgraphs
+from ._graph import all_constants, all_names, defines, subgraphs, walk
 
 
 class UnrollTooLarge(Exception):
@@ -41,12 +41,34 @@ def unroll(model, max_nodes=100_000):
     return result
 
 
+def inline_constant_ifs(model):
+    """A copy of `model` with every `If` whose condition is a constant replaced by the
+    branch it would take.
+
+    Differentiating the result needs no recursion at all, and the branch not taken is not
+    kept around to be differentiated for nothing. Branches are inlined at any depth.
+    """
+    state = _State(model, max_nodes=float("inf"))
+    if not any(node.op_type == "If" and node.input[0] in state.values
+               for scope in walk(model.graph) for node in scope.node):
+        return model
+    result = type(model)()
+    result.CopyFrom(model)
+    graph = result.graph
+    nodes = state.inline(list(graph.node))
+    graph.ClearField("node")
+    graph.node.extend(nodes)
+    graph.initializer.extend(state.b.initializers)
+    return result
+
+
 class _State:
     def __init__(self, model, max_nodes):
         self.shapes = Shapes(model)
         self.values = all_constants(model.graph)
         self.b = Builder(all_names(model.graph))
         self.budget = max_nodes
+        self._hoisted = {}
 
     def spend(self, count):
         self.budget -= count
@@ -68,15 +90,33 @@ class _State:
                 out.append(node)
         return out
 
-    def descend(self, node):
-        """Unroll inside the subgraphs of a node that is not itself unrolled."""
+    def inline(self, nodes):
+        out = []
+        for node in nodes:
+            condition = self.values.get(node.input[0]) if node.op_type == "If" else None
+            if condition is not None:
+                taken = attribute(node, "then_branch" if bool(condition.reshape(-1)[0])
+                                  else "else_branch")
+                copied, outputs = self.instantiate(taken, {})
+                out.extend(self.inline(copied))
+                out.extend(helper.make_node("Identity", [value], [name])
+                           for value, name in zip(outputs, node.output))
+            elif subgraphs(node):
+                out.append(self.descend(node, self.inline))
+            else:
+                out.append(node)
+        return out
+
+    def descend(self, node, into=None):
+        """Rewrite inside the subgraphs of a node that is not itself rewritten."""
+        into = into or self.nodes
         copy = helper.make_node(node.op_type, list(node.input), list(node.output),
                                 name=node.name, domain=node.domain)
         for attribute_ in node.attribute:
             if attribute_.type == attribute_.GRAPH:
                 inner = type(attribute_.g)()
                 inner.CopyFrom(attribute_.g)
-                body = self.nodes(list(inner.node))
+                body = into(list(inner.node))
                 inner.ClearField("node")
                 inner.node.extend(body)
                 copy.attribute.append(helper.make_attribute(attribute_.name, inner))
@@ -105,9 +145,33 @@ class _State:
         return int(value.reshape(-1)[0])
 
     # ------------------------------------------------------------------ copying ------
+    def hoisted(self, body):
+        """A body's own initializers, moved to the outer graph under fresh names -- once
+        per body, since every copy of it reads the same constants.
+
+        The cache holds the body itself as well as its mapping. A protobuf submessage is a
+        proxy nothing else keeps alive, and once one is freed a different body can be handed
+        the same `id` -- and would silently inherit the wrong constants.
+        """
+        key = id(body)
+        if key not in self._hoisted or self._hoisted[key][0] is not body:
+            names = {}
+            for tensor in body.initializer:
+                fresh = self.b.name(tensor.name + "_h")
+                copy = type(tensor)()
+                copy.CopyFrom(tensor)
+                copy.name = fresh
+                self.b.initializers.append(copy)
+                self.shapes.declare(fresh, tuple(tensor.dims), tensor.data_type)
+                self.values[fresh] = self.values.get(tensor.name)
+                names[tensor.name] = fresh
+            self._hoisted[key] = (body, names)
+        return self._hoisted[key][1]
+
     def instantiate(self, body, bindings):
         """One copy of a body with its inputs bound; returns the nodes and output names."""
-        mapping = dict(bindings)
+        mapping = dict(self.hoisted(body))
+        mapping.update(bindings)
         copied = []
         for node in body.node:
             copied.append(self.rename(node, mapping))

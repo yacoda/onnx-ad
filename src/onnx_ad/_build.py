@@ -223,8 +223,11 @@ class Context:
         self._replacement = node
 
     def replace_primal(self, original, node):
-        """Reverse: have the primal pass run `node` instead of `original` (to tape it)."""
-        self._replacements[id(original)] = node
+        """Reverse: have the primal pass run `node` instead of `original` (to tape it).
+
+        Keyed by identity, with the original kept alongside: protobuf proxies are only
+        stable while something holds them, and a reused `id` must not match."""
+        self._replacements[id(original)] = (original, node)
 
     def value_info(self, name, primal, seeded=True):
         """A subgraph input or output typed like `primal`, plus a seed axis if seeded."""

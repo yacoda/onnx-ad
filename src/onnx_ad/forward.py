@@ -8,6 +8,7 @@ the primal outputs remain available and the model can be differentiated again.
 """
 from . import control  # noqa: F401 -- registers the If/Scan/Loop rules
 from ._build import (Context, assemble, conventions, rename, seeded_value_info, select)
+from .unroll import inline_constant_ifs
 from ._passes import forward_nodes
 
 
@@ -25,6 +26,7 @@ def forward(model, inputs=None, outputs=None, prefix=None, dim=None, layout="cas
     forward pass before. `layout` decides how the seeds are shaped -- see `reverse`.
     """
     prefix, dim = conventions(model, "fwd", prefix, dim)
+    model = inline_constant_ifs(model)  # a constant condition needs no subgraph at all
     result = type(model)()
     result.CopyFrom(model)
     graph = result.graph
