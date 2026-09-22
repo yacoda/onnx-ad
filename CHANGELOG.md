@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-09-22
 
 Control flow, and second-order families that 0.1.0 could not build.
 
