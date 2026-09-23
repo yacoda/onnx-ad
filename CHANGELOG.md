@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-09-23
 
 Operation coverage: everything in the default domain that carries a floating-point
 derivative, bar `MaxRoiPool`, max-mode `RoiAlign` and the `Sequence`/`Optional` types.
